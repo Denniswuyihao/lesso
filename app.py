@@ -635,7 +635,13 @@ else:
                 unsafe_allow_html=True,
             )
             with st.form("preview_add_form"):
-                pq = st.number_input("加入数量", min_value=1, value=max(qty_number(st.session_state.cart.get(preview_sap, {}).get("quantity", 1), 1.0), 1.0), step=1.0)
+                pq = st.number_input(
+    "加入数量",
+    min_value=1.0,
+    value=float(max(qty_number(st.session_state.cart.get(preview_sap, {}).get("quantity", 1), 1.0), 1.0)),
+    step=1.0,
+    format="%.4f",
+)
                 add_one = st.form_submit_button("加入当前确认产品", use_container_width=True)
             if add_one:
                 item = preview_row.to_dict()
