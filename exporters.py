@@ -9,6 +9,7 @@ from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
 import pandas as pd
 import requests
@@ -44,14 +45,17 @@ TEXT_MUTED = "#666666"
 # -------------------------
 
 def _headers(lang: str) -> list[str]:
+    # Excel export uses a quote table close to the user's product template:
+    # image + sap/category/name/model/description/price/stock/cbm/unit/package,
+    # with quantity/amount columns added for quotation use.
     if lang == "en":
         return [
-            "SAP", "Category", "Product Name", "Model", "Image", "Description", "Base Price (USD)", "Quote Price (USD)",
-            "Qty", "Amount (USD)", "Stock", "CBM/PC", "Total CBM", "Package"
+            "Image", "SAP", "Category", "Product Name", "Model", "Description",
+            "Unit Price (USD)", "Qty", "Amount (USD)", "Stock", "CBM/PC", "Total CBM", "Unit", "Package"
         ]
     return [
-        "SAP号", "分类", "品名", "型号", "图片", "描述", "原价(USD)", "报价(USD)",
-        "数量", "金额(USD)", "库存", "包装体积/件", "总CBM", "包装"
+        "图片", "SAP号", "分类", "品名", "型号", "描述",
+        "单价(USD)", "数量", "金额(USD)", "库存", "CBM/件", "总CBM", "单位", "包装信息"
     ]
 
 def _title(lang: str) -> str:
@@ -89,12 +93,61 @@ def _safe_text(value: object) -> str:
 # Images
 # -------------------------
 
+def _read_runtime_secret(name: str, default: str | None = None) -> str | None:
+    """Read env/Streamlit secrets without failing during local tests."""
+    value = os.getenv(name)
+    if value:
+        return value
+    try:
+        import streamlit as st
+        value = st.secrets.get(name)
+        if value:
+            return str(value)
+    except Exception:
+        pass
+    return default
+
+
+def _storage_public_url(storage_path: str) -> str:
+    """Build a Supabase public URL for relative product image paths."""
+    supabase_url = (_read_runtime_secret("SUPABASE_URL", "https://oevlzhvdgojgzacnbfka.supabase.co") or "").rstrip("/")
+    bucket = (_read_runtime_secret("SUPABASE_STORAGE_BUCKET", "product-images") or "product-images").strip("/")
+    encoded_path = quote(str(storage_path).strip().lstrip("/"), safe="/")
+    if not supabase_url or not bucket or not encoded_path:
+        return ""
+    return f"{supabase_url}/storage/v1/object/public/{bucket}/{encoded_path}"
+
+
 def resolve_image_url(image_url: str | None, sap: str | None = None) -> str:
-    """Return the cloud image URL. Stable version intentionally does not use local images."""
+    """Return a safe browser-loadable image URL.
+
+    Accepted inputs:
+    - Full public URL: https://.../product-images/products/8110010814.png
+    - Storage path: products/8110010814.png
+    - File name: 8110010814.png
+
+    Empty/NaN/invalid values return an empty string. This prevents Streamlit from
+    treating a file name like `8110010814.png` as a missing local file, which can
+    raise MediaFileStorageError.
+    """
     value = str(image_url or "").strip()
+    if value.lower() in {"", "none", "nan", "null"}:
+        return ""
     if value.startswith("http://") or value.startswith("https://"):
         return value
-    return ""
+
+    prefix = (_read_runtime_secret("SUPABASE_STORAGE_PREFIX", "products") or "products").strip("/")
+
+    # If image_url is a plain file name, put it under the configured product folder.
+    if "/" not in value and prefix:
+        value = f"{prefix}/{value}"
+
+    # If value is just a SAP code, default to SAP.png under product folder.
+    if "." not in Path(value).name and sap:
+        name = f"{str(sap).strip()}.png"
+        value = f"{prefix}/{name}" if prefix else name
+
+    return _storage_public_url(value)
 
 
 def image_to_data_uri(image_url: str | None, sap: str | None = None) -> str:
@@ -279,7 +332,12 @@ def _pdf_lines_auto(lines: list[object], styles: dict[str, ParagraphStyle], styl
 # -------------------------
 
 def export_quote_excel(items: pd.DataFrame, customer: str, quote_no: str, price_note: str = "", lang: str = "zh") -> bytes:
-    """Export an A4 portrait Excel quotation. lang='zh' or 'en'."""
+    """Export an A4 portrait Excel quotation.
+
+    The table layout follows the product database template as closely as possible,
+    with quotation fields added: image, quantity, amount and total CBM. Images are
+    embedded inside the table image column, not placed outside the sheet.
+    """
     wb = Workbook()
     ws = wb.active
     ws.title = "Quotation" if lang == "en" else "报价单"
@@ -330,40 +388,56 @@ def export_quote_excel(items: pd.DataFrame, customer: str, quote_no: str, price_
         cell.border = border
     ws.row_dimensions[start_row].height = 26
 
-    for _, row in items.iterrows():
+    # Ensure expected columns exist.
+    safe_items = items.copy()
+    for col in ["sap", "category", "cn_name", "en_name", "model", "description", "quote_price", "quantity", "amount", "stock", "packing_volume", "total_volume", "unit", "package_info", "image_url"]:
+        if col not in safe_items.columns:
+            safe_items[col] = ""
+
+    for _, row in safe_items.iterrows():
         ws.append([
-            row.get("sap", ""), row.get("category", ""), _name(row, lang), row.get("model", ""), "",
-            row.get("description", ""), row.get("base_price", 0), row.get("quote_price", 0), row.get("quantity", 1),
-            row.get("amount", 0), row.get("stock", 0), row.get("packing_volume", 0), row.get("total_volume", 0),
+            "",
+            row.get("sap", ""),
+            row.get("category", ""),
+            _name(row, lang),
+            row.get("model", ""),
+            row.get("description", ""),
+            row.get("quote_price", row.get("price", 0)),
+            row.get("quantity", 1),
+            row.get("amount", 0),
+            row.get("stock", 0),
+            row.get("packing_volume", 0),
+            row.get("total_volume", 0),
+            row.get("unit", "PC"),
             row.get("package_info", ""),
         ])
         current_row = ws.max_row
-        ws.row_dimensions[current_row].height = 68
+        ws.row_dimensions[current_row].height = 76
         image_url = row.get("image_url")
         if image_url:
             try:
-                xl_img, img_buffer = _excel_image_from_url(str(image_url))
+                xl_img, img_buffer = _excel_image_from_url(str(image_url), max_px=68)
                 if xl_img is not None:
-                    # Keep the BytesIO object alive until workbook.save().
                     if not hasattr(wb, "_quote_image_buffers"):
                         wb._quote_image_buffers = []
                     wb._quote_image_buffers.append(img_buffer)
-                    ws.add_image(xl_img, f"E{current_row}")
+                    # Place the image in the table image cell.
+                    ws.add_image(xl_img, f"A{current_row}")
                 else:
-                    ws[f"E{current_row}"] = "Image error" if lang == "en" else "图片读取失败"
+                    ws[f"A{current_row}"] = "Image error" if lang == "en" else "图片读取失败"
             except Exception:
-                ws[f"E{current_row}"] = "Image error" if lang == "en" else "图片读取失败"
+                ws[f"A{current_row}"] = "Image error" if lang == "en" else "图片读取失败"
 
     last_row = ws.max_row
     total_row = last_row + 1
-
     total_label = "TOTAL" if lang == "en" else "合计"
-    # 总计行紧贴产品表，不留空行；左侧合并，金额放在“金额(USD)”列下方，体积放在“总CBM”列下方。
-    ws.merge_cells(start_row=total_row, start_column=1, end_row=total_row, end_column=8)
+
+    # 总计行紧贴产品表，不留空行；金额放在“金额(USD)”列下方，体积放在“总CBM”列下方。
+    ws.merge_cells(start_row=total_row, start_column=1, end_row=total_row, end_column=7)
     ws.cell(total_row, 1).value = total_label
+    ws.cell(total_row, 8).value = f"=SUM(H{start_row + 1}:H{last_row})"
     ws.cell(total_row, 9).value = f"=SUM(I{start_row + 1}:I{last_row})"
-    ws.cell(total_row, 10).value = f"=SUM(J{start_row + 1}:J{last_row})"
-    ws.cell(total_row, 13).value = f"=SUM(M{start_row + 1}:M{last_row})"
+    ws.cell(total_row, 12).value = f"=SUM(L{start_row + 1}:L{last_row})"
 
     for col_idx in range(1, max_col + 1):
         cell = ws.cell(total_row, col_idx)
@@ -371,38 +445,38 @@ def export_quote_excel(items: pd.DataFrame, customer: str, quote_no: str, price_
         cell.border = border
         cell.font = Font(name="Microsoft YaHei", bold=True, size=10)
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    ws.cell(total_row, 10).number_format = '"USD" #,##0.00'
-    ws.cell(total_row, 13).number_format = "0.0000"
+    ws.cell(total_row, 9).number_format = '"USD" #,##0.00'
+    ws.cell(total_row, 12).number_format = "0.0000"
     ws.row_dimensions[total_row].height = 26
 
     widths = {
-        "A": 12, "B": 11, "C": 24, "D": 14, "E": 13, "F": 28, "G": 11, "H": 11,
-        "I": 7, "J": 12, "K": 8, "L": 11, "M": 9, "N": 18,
+        "A": 13, "B": 12, "C": 13, "D": 24, "E": 16, "F": 30, "G": 12,
+        "H": 8, "I": 12, "J": 8, "K": 10, "L": 10, "M": 8, "N": 18,
     }
     for col, width in widths.items():
         ws.column_dimensions[col].width = width
 
-    for row in ws.iter_rows(min_row=start_row, max_row=last_row, min_col=1, max_col=max_col):
+    for row in ws.iter_rows(min_row=start_row, max_row=total_row, min_col=1, max_col=max_col):
         for cell in row:
             cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
             cell.border = border
-            if cell.row > start_row:
+            if cell.row > start_row and cell.row < total_row:
                 cell.font = Font(name="Microsoft YaHei", size=9)
+
     for row_idx in range(start_row + 1, last_row + 1):
-        ws[f"C{row_idx}"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        ws[f"D{row_idx}"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
         ws[f"F{row_idx}"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
         ws[f"N{row_idx}"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
-        for col in ["G", "H", "J"]:
+        for col in ["G", "I"]:
             ws[f"{col}{row_idx}"].number_format = '"USD" #,##0.00'
-        for col in ["L", "M"]:
+        for col in ["K", "L"]:
             ws[f"{col}{row_idx}"].number_format = "0.0000"
 
     ws.freeze_panes = "A5"
     ws.auto_filter.ref = f"A{start_row}:N{last_row}"
 
-    # A4 portrait print settings
     ws.page_setup.paperSize = ws.PAPERSIZE_A4
-    ws.page_setup.orientation = ws.ORIENTATION_PORTRAIT
+    ws.page_setup.orientation = ws.ORIENTATION_LANDSCAPE
     ws.page_setup.fitToWidth = 1
     ws.page_setup.fitToHeight = 0
     ws.sheet_properties.pageSetUpPr.fitToPage = True
@@ -791,5 +865,399 @@ def export_quote_pdf(items: pd.DataFrame, customer: str, quote_no: str, price_no
         elements,
         onFirstPage=lambda canvas, d: _draw_footer(canvas, d, lang, styles["base_font"]),
         onLaterPages=lambda canvas, d: _draw_footer(canvas, d, lang, styles["base_font"]),
+    )
+    return bio.getvalue()
+
+# =====================================================================
+# v4 PPR field structure export overrides
+# Keep these definitions at the end so they override the older exports above.
+# =====================================================================
+from reportlab.lib.pagesizes import landscape
+
+
+def _quote_headers_v4(lang: str) -> list[str]:
+    if lang == "en":
+        return ["SAP", "Category", "Product / Model", "Image", "Description", "Unit", "Unit Price", "Qty", "Amount", "Qty/CTN", "CBM"]
+    return ["SAP号", "分类", "品名型号", "图片", "描述", "单位", "单价", "数量", "金额", "Qty/CTN", "CBM"]
+
+
+def _clean_display(value: object) -> str:
+    text = str(value or "").strip()
+    if text.lower() in {"nan", "none", "null", "#n/a", "#name?", "#value!"}:
+        return ""
+    if text.endswith(".0") and text[:-2].isdigit():
+        return text[:-2]
+    return text
+
+
+def _num(value: object, default: float = 0.0) -> float:
+    try:
+        text_value = _clean_display(value).replace(",", "")
+        return float(text_value) if text_value else default
+    except Exception:
+        return default
+
+
+def _qty_display(value: object) -> str:
+    n = _num(value)
+    if n == 0:
+        return ""
+    return str(int(n)) if float(n).is_integer() else f"{n:g}"
+
+
+def _product_model_text(row: pd.Series | dict, lang: str) -> str:
+    name = _name(row, lang)
+    model = _clean_display(row.get("model"))
+    size = _clean_display(row.get("size_mm"))
+    color = _clean_display(row.get("color"))
+    parts = [name]
+    detail_parts = []
+    if model:
+        detail_parts.append(model)
+    elif size:
+        detail_parts.append(size)
+    if color:
+        detail_parts.append(color)
+    if detail_parts:
+        parts.append(" / ".join(detail_parts))
+    return "\n".join([p for p in parts if p])
+
+
+def _description_text(row: pd.Series | dict, lang: str) -> str:
+    desc = _clean_display(row.get("description"))
+    material = _clean_display(row.get("material_description"))
+    weight = _qty_display(row.get("weight"))
+    package = _clean_display(row.get("package_info"))
+    lines = []
+    if desc:
+        lines.append(desc)
+    if material and material not in desc:
+        lines.append(material)
+    if weight:
+        lines.append(("Weight: " if lang == "en" else "重量：") + f"{weight} kg/m or pc")
+    if package:
+        lines.append(("Package: " if lang == "en" else "包装：") + package)
+    return "\n".join(lines)
+
+
+def _excel_image_for_cell(image_url: str | None, target_w_px: int = 118, target_h_px: int = 106) -> tuple[Optional[XLImage], Optional[BytesIO]]:
+    data = _download_image_bytes(image_url)
+    if not data:
+        return None, None
+    bio = BytesIO(data)
+    try:
+        xl_img = XLImage(bio)
+        # User requirement: occupy the picture cell. Stretching is intentional.
+        xl_img.width = target_w_px
+        xl_img.height = target_h_px
+        try:
+            xl_img.object_position = 1
+        except Exception:
+            pass
+        return xl_img, bio
+    except Exception:
+        return None, None
+
+
+def export_quote_excel(items: pd.DataFrame, customer: str, quote_no: str, price_note: str = "", lang: str = "zh") -> bytes:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Quotation" if lang == "en" else "报价单"
+
+    labels = _field_labels(lang)
+    headers = _quote_headers_v4(lang)
+    max_col = len(headers)
+    navy = "1F4E78"
+    light_fill = "F7F9FC"
+    border_color = "D9E2F3"
+    total_fill = "EAF2F8"
+
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=max_col)
+    ws.cell(1, 1).value = _title(lang)
+    ws.cell(1, 1).font = Font(name="Microsoft YaHei", size=16, bold=True, color="FFFFFF")
+    ws.cell(1, 1).alignment = Alignment(horizontal="center", vertical="center")
+    ws.cell(1, 1).fill = PatternFill("solid", fgColor=navy)
+    ws.row_dimensions[1].height = 30
+
+    ws["A2"] = labels["customer"]
+    ws["B2"] = customer or ""
+    ws["D2"] = labels["quote_no"]
+    ws["E2"] = quote_no
+    ws["G2"] = labels["date"]
+    ws["H2"] = datetime.now().strftime("%Y-%m-%d")
+    ws["J2"] = labels["rule"]
+    ws["K2"] = price_note
+    for cell in ws[2]:
+        cell.fill = PatternFill("solid", fgColor=light_fill)
+        cell.alignment = Alignment(vertical="center", wrap_text=True)
+        cell.font = Font(name="Microsoft YaHei", size=9)
+    ws.row_dimensions[2].height = 24
+
+    start_row = 4
+    for col_idx, header in enumerate(headers, 1):
+        ws.cell(start_row, col_idx).value = header
+
+    thin = Side(style="thin", color=border_color)
+    border = Border(top=thin, left=thin, right=thin, bottom=thin)
+    for cell in ws[start_row]:
+        cell.fill = PatternFill("solid", fgColor=navy)
+        cell.font = Font(name="Microsoft YaHei", color="FFFFFF", bold=True, size=9)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = border
+    ws.row_dimensions[start_row].height = 25
+
+    safe_items = items.copy()
+    for col in [
+        "sap", "category", "cn_name", "en_name", "model", "description", "color", "size_mm", "weight",
+        "material_description", "quote_price", "price", "quantity", "amount", "packing_volume", "total_volume",
+        "qty_per_ctn", "unit", "package_info", "image_url",
+    ]:
+        if col not in safe_items.columns:
+            safe_items[col] = ""
+
+    for _, row in safe_items.iterrows():
+        ws.append([
+            _clean_display(row.get("sap")),
+            _clean_display(row.get("category")),
+            _product_model_text(row, lang),
+            "",
+            _description_text(row, lang),
+            _clean_display(row.get("unit")) or "PC",
+            _num(row.get("quote_price", row.get("price", 0))),
+            int(_num(row.get("quantity"), 1) or 1),
+            _num(row.get("amount")),
+            _num(row.get("qty_per_ctn")),
+            _num(row.get("total_volume", row.get("packing_volume", 0))),
+        ])
+        current_row = ws.max_row
+        ws.row_dimensions[current_row].height = 86
+        image_url = row.get("image_url")
+        if image_url:
+            try:
+                xl_img, img_buffer = _excel_image_for_cell(str(image_url), target_w_px=118, target_h_px=106)
+                if xl_img is not None:
+                    if not hasattr(wb, "_quote_image_buffers"):
+                        wb._quote_image_buffers = []
+                    wb._quote_image_buffers.append(img_buffer)
+                    ws.add_image(xl_img, f"D{current_row}")
+                else:
+                    ws[f"D{current_row}"] = "Image error" if lang == "en" else "图片读取失败"
+            except Exception:
+                ws[f"D{current_row}"] = "Image error" if lang == "en" else "图片读取失败"
+
+    last_row = ws.max_row
+    total_row = last_row + 1
+    ws.merge_cells(start_row=total_row, start_column=1, end_row=total_row, end_column=7)
+    ws.cell(total_row, 1).value = "TOTAL" if lang == "en" else "合计"
+    ws.cell(total_row, 8).value = f"=SUM(H{start_row + 1}:H{last_row})"
+    ws.cell(total_row, 9).value = f"=SUM(I{start_row + 1}:I{last_row})"
+    ws.cell(total_row, 11).value = f"=SUM(K{start_row + 1}:K{last_row})"
+
+    for col_idx in range(1, max_col + 1):
+        cell = ws.cell(total_row, col_idx)
+        cell.fill = PatternFill("solid", fgColor=total_fill)
+        cell.border = border
+        cell.font = Font(name="Microsoft YaHei", bold=True, size=10)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws.row_dimensions[total_row].height = 25
+
+    widths = {
+        "A": 13, "B": 20, "C": 30, "D": 17, "E": 42, "F": 8,
+        "G": 12, "H": 8, "I": 12, "J": 11, "K": 11,
+    }
+    for col, width in widths.items():
+        ws.column_dimensions[col].width = width
+
+    for row in ws.iter_rows(min_row=start_row, max_row=total_row, min_col=1, max_col=max_col):
+        for cell in row:
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            cell.border = border
+            if cell.row > start_row and cell.row < total_row:
+                cell.font = Font(name="Microsoft YaHei", size=9)
+    for row_idx in range(start_row + 1, last_row + 1):
+        ws[f"C{row_idx}"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        ws[f"E{row_idx}"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        for col in ["G", "I"]:
+            ws[f"{col}{row_idx}"].number_format = '"USD" #,##0.00'
+        for col in ["J"]:
+            ws[f"{col}{row_idx}"].number_format = "0"
+        for col in ["K"]:
+            ws[f"{col}{row_idx}"].number_format = "0.0000"
+    ws.cell(total_row, 9).number_format = '"USD" #,##0.00'
+    ws.cell(total_row, 11).number_format = "0.0000"
+
+    ws.freeze_panes = "A5"
+    ws.auto_filter.ref = f"A{start_row}:K{last_row}"
+    ws.page_setup.paperSize = ws.PAPERSIZE_A4
+    ws.page_setup.orientation = ws.ORIENTATION_LANDSCAPE
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.page_margins.left = 0.25
+    ws.page_margins.right = 0.25
+    ws.page_margins.top = 0.35
+    ws.page_margins.bottom = 0.35
+    ws.print_title_rows = f"{start_row}:{start_row}"
+
+    bio = BytesIO()
+    wb.save(bio)
+    return bio.getvalue()
+
+
+def _make_pdf_styles_v4(lang: str) -> dict[str, ParagraphStyle]:
+    cn_font = _register_cn_font()
+    base_font = "Helvetica" if lang == "en" else cn_font
+    bold_font = "Helvetica-Bold" if lang == "en" else cn_font
+    styles = getSampleStyleSheet()
+    return {
+        "base_font": base_font,
+        "bold_font": bold_font,
+        "title": ParagraphStyle("QuoteTitleV4", parent=styles["Title"], fontName=bold_font, fontSize=15, leading=20, textColor=colors.HexColor(BRAND_BLUE), alignment=TA_RIGHT),
+        "normal": ParagraphStyle("QuoteNormalV4", parent=styles["Normal"], fontName=base_font, fontSize=7.2, leading=10.5, textColor=colors.HexColor(TEXT_DARK), wordWrap="CJK"),
+        "small": ParagraphStyle("QuoteSmallV4", parent=styles["Normal"], fontName=base_font, fontSize=6.8, leading=9.8, textColor=colors.HexColor(TEXT_MUTED), wordWrap="CJK"),
+        "num": ParagraphStyle("QuoteNumV4", parent=styles["Normal"], fontName="Helvetica", fontSize=7.0, leading=10.0, alignment=TA_RIGHT, textColor=colors.HexColor(TEXT_DARK)),
+        "center": ParagraphStyle("QuoteCenterV4", parent=styles["Normal"], fontName=base_font, fontSize=7.0, leading=10.0, alignment=TA_CENTER, textColor=colors.HexColor(TEXT_DARK), wordWrap="CJK"),
+        "header": ParagraphStyle("QuoteHeaderV4", parent=styles["Normal"], fontName=bold_font, fontSize=6.8, leading=9.2, alignment=TA_CENTER, textColor=colors.white, wordWrap="CJK"),
+        "normal_cjk": ParagraphStyle("QuoteNormalCJKV4", parent=styles["Normal"], fontName=cn_font, fontSize=7.2, leading=10.5, textColor=colors.HexColor(TEXT_DARK), wordWrap="CJK"),
+        "small_cjk": ParagraphStyle("QuoteSmallCJKV4", parent=styles["Normal"], fontName=cn_font, fontSize=6.8, leading=9.8, textColor=colors.HexColor(TEXT_MUTED), wordWrap="CJK"),
+    }
+
+
+def _pdf_cell(text_value: object, styles: dict[str, ParagraphStyle], key: str = "normal") -> Paragraph:
+    text_value = _clean_display(text_value).replace("\n", "<br/>")
+    if key in {"normal", "small"} and _contains_cjk(text_value):
+        key = key + "_cjk"
+    return Paragraph(_safe_text(text_value).replace("\n", "<br/>").replace("&lt;br/&gt;", "<br/>"), styles[key])
+
+
+def _pdf_image_v4(image_url: str | None, max_w: float = 22 * mm, max_h: float = 18 * mm) -> object:
+    img = _pdf_image_from_url(image_url, max_w=max_w, max_h=max_h)
+    return img if img is not None else ""
+
+
+def _draw_footer_v4(canvas, doc, lang: str, base_font: str):
+    width, _ = doc.pagesize
+    canvas.saveState()
+    canvas.setFont("Helvetica", 6.5)
+    canvas.setStrokeColor(colors.HexColor(BORDER_BLUE))
+    canvas.line(doc.leftMargin, 8 * mm, width - doc.rightMargin, 8 * mm)
+    canvas.setFillColor(colors.HexColor(TEXT_MUTED))
+    canvas.drawString(doc.leftMargin, 4.8 * mm, "LESSO Plumbing & Sanitary Ware")
+    canvas.drawRightString(width - doc.rightMargin, 4.8 * mm, f"Page {doc.page}")
+    canvas.restoreState()
+
+
+def export_quote_pdf(items: pd.DataFrame, customer: str, quote_no: str, price_note: str = "", lang: str = "zh") -> bytes:
+    bio = BytesIO()
+    page_size = landscape(A4)
+    doc = SimpleDocTemplate(
+        bio,
+        pagesize=page_size,
+        rightMargin=8 * mm,
+        leftMargin=8 * mm,
+        topMargin=8 * mm,
+        bottomMargin=12 * mm,
+    )
+    styles = _make_pdf_styles_v4(lang)
+    labels = _field_labels(lang)
+    elements: list[object] = []
+
+    brand_sub = "Plumbing & Sanitary Ware | International Quotation" if lang == "en" else "联塑水暖卫浴 / 外贸报价单"
+    quote_title = "QUOTATION" if lang == "en" else "正式报价单"
+    header = Table([
+        [Paragraph("LESSO", ParagraphStyle("BrandV4", fontName="Helvetica-Bold", fontSize=19, leading=23, textColor=colors.white)), Paragraph(_safe_text(quote_title), styles["title"])],
+        [Paragraph(_safe_text(brand_sub), ParagraphStyle("BrandSubV4", fontName=styles["base_font"], fontSize=8.2, leading=11, textColor=colors.HexColor("#EEF4FA"), wordWrap="CJK")), Paragraph(datetime.now().strftime("%Y-%m-%d"), styles["small"])],
+    ], colWidths=[110 * mm, 171 * mm])
+    header.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor(BRAND_BLUE)),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 7),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
+    elements.append(header)
+    elements.append(Spacer(1, 5))
+
+    info = Table([
+        [_pdf_cell(labels["customer"], styles, "small"), _pdf_cell(customer or "", styles), _pdf_cell(labels["quote_no"], styles, "small"), _pdf_cell(quote_no, styles), _pdf_cell(labels["date"], styles, "small"), _pdf_cell(datetime.now().strftime("%Y-%m-%d"), styles)],
+        [_pdf_cell(labels["rule"], styles, "small"), _pdf_cell(price_note, styles), _pdf_cell(labels["currency"], styles, "small"), _pdf_cell("USD", styles), _pdf_cell(labels["validity"], styles, "small"), _pdf_cell("Subject to final PI" if lang == "en" else "以最终PI为准", styles)],
+    ], colWidths=[20*mm, 70*mm, 22*mm, 55*mm, 18*mm, 96*mm])
+    info.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor(LIGHT_BG)),
+        ("BOX", (0, 0), (-1, -1), 0.4, colors.HexColor(BORDER_BLUE)),
+        ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.HexColor(BORDER_BLUE)),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 5),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
+    elements.append(info)
+    elements.append(Spacer(1, 6))
+
+    headers = _quote_headers_v4(lang)
+    data: list[list[object]] = [[Paragraph(_safe_text(h), styles["header"]) for h in headers]]
+    safe_items = items.copy()
+    for col in ["sap", "category", "cn_name", "en_name", "model", "description", "color", "size_mm", "weight", "material_description", "quote_price", "price", "quantity", "amount", "total_volume", "packing_volume", "qty_per_ctn", "unit", "package_info", "image_url"]:
+        if col not in safe_items.columns:
+            safe_items[col] = ""
+
+    for _, r in safe_items.iterrows():
+        data.append([
+            _pdf_cell(r.get("sap"), styles, "center"),
+            _pdf_cell(r.get("category"), styles, "small"),
+            _pdf_cell(_product_model_text(r, lang), styles, "normal"),
+            _pdf_image_v4(str(r.get("image_url") or "")),
+            _pdf_cell(_description_text(r, lang), styles, "small"),
+            _pdf_cell(r.get("unit") or "PC", styles, "center"),
+            Paragraph(f"{_num(r.get('quote_price', r.get('price', 0))):.2f}", styles["num"]),
+            Paragraph(str(int(_num(r.get("quantity"), 1) or 1)), styles["center"]),
+            Paragraph(f"{_num(r.get('amount')):.2f}", styles["num"]),
+            Paragraph(_qty_display(r.get("qty_per_ctn")), styles["center"]),
+            Paragraph(f"{_num(r.get('total_volume', r.get('packing_volume', 0))):.4f}", styles["num"]),
+        ])
+
+    col_widths = [22*mm, 28*mm, 44*mm, 24*mm, 55*mm, 12*mm, 20*mm, 10*mm, 20*mm, 15*mm, 16*mm]
+    table = Table(data, repeatRows=1, colWidths=col_widths, hAlign="LEFT")
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(BRAND_BLUE)),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor(BORDER_BLUE)),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+        ("ALIGN", (3, 1), (3, -1), "CENTER"),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor(SOFT_BG)]),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("TOPPADDING", (0, 0), (-1, 0), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, 0), 6),
+    ]))
+    elements.append(table)
+    elements.append(Spacer(1, 6))
+
+    sku_count = int(safe_items["sap"].nunique()) if not safe_items.empty else 0
+    total_qty = int(pd.to_numeric(safe_items["quantity"], errors="coerce").fillna(0).sum()) if not safe_items.empty else 0
+    total_amount = float(pd.to_numeric(safe_items["amount"], errors="coerce").fillna(0).sum()) if not safe_items.empty else 0
+    total_cbm = float(pd.to_numeric(safe_items["total_volume"], errors="coerce").fillna(0).sum()) if not safe_items.empty else 0
+    summary = Table([[ _pdf_cell(labels["sku"], styles, "small"), Paragraph(str(sku_count), styles["center"]), _pdf_cell(labels["qty"], styles, "small"), Paragraph(str(total_qty), styles["center"]), _pdf_cell(labels["amount"], styles, "small"), Paragraph(f"{total_amount:.2f}", styles["num"]), _pdf_cell(labels["cbm"], styles, "small"), Paragraph(f"{total_cbm:.4f}", styles["num"]) ]], colWidths=[18*mm, 16*mm, 20*mm, 16*mm, 27*mm, 28*mm, 18*mm, 24*mm], hAlign="RIGHT")
+    summary.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor(LIGHT_BG)),
+        ("BOX", (0, 0), (-1, -1), 0.4, colors.HexColor(BORDER_BLUE)),
+        ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.HexColor(BORDER_BLUE)),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 5),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
+    elements.append(summary)
+
+    doc.build(
+        elements,
+        onFirstPage=lambda canvas, d: _draw_footer_v4(canvas, d, lang, styles["base_font"]),
+        onLaterPages=lambda canvas, d: _draw_footer_v4(canvas, d, lang, styles["base_font"]),
     )
     return bio.getvalue()

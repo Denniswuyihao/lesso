@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from datetime import datetime
 import hashlib
+import html
+import re
+from typing import Any
 
 import pandas as pd
 import streamlit as st
@@ -21,156 +24,151 @@ from database import (
     set_user_active,
     upsert_products,
 )
-from exporters import export_quote_excel, export_quote_pdf, get_pdf_font_status
+from exporters import export_quote_excel, export_quote_pdf, get_pdf_font_status, resolve_image_url
 from quote_engine import PriceRule, build_quote_items, quote_summary
 
-st.set_page_config(page_title="外贸报价表自动生成系统", layout="wide", page_icon="📦")
 
 # -----------------------------------------------------------------------------
-# One-time initialization
+# Init
 # -----------------------------------------------------------------------------
-init_db()
-ensure_default_admin()
+st.set_page_config(page_title="LESSO 报价系统", page_icon="📦", layout="wide")
+
+try:
+    init_db()
+    ensure_default_admin()
+except Exception as exc:
+    st.error("系统初始化失败。请检查 Supabase DATABASE_URL、products 表结构和网络连接。")
+    st.exception(exc)
+    st.stop()
+
 
 # -----------------------------------------------------------------------------
-# UI styles: conservative business look, avoid decorative overhead.
+# UI style
 # -----------------------------------------------------------------------------
 st.markdown(
     """
     <style>
-    .main .block-container {
-        padding-top: 3.2rem !important;
-        padding-bottom: 2rem;
-        max-width: 1360px;
-    }
-    header[data-testid="stHeader"] {
-        background: rgba(255,255,255,0.96);
-        box-shadow: none;
-    }
-    .app-header {
-        padding: 2px 0 12px 0;
-        margin: 0 0 12px 0;
-        border-bottom: 1px solid #EEF0F3;
-        background: #FFFFFF;
-    }
-    .app-title {
-        margin: 0;
-        padding: 0;
-        line-height: 1.35;
-        font-size: 24px;
-        font-weight: 700;
-        color: #1F2937;
-        letter-spacing: .1px;
-    }
-    .app-subtitle {
-        margin: 5px 0 0 0;
-        padding: 0;
-        line-height: 1.45;
-        color: #6B7280;
-        font-size: 13px;
-    }
-    .step-title {
-        font-size: 17px;
-        font-weight: 700;
-        color: #111827;
-        margin: 0 0 6px 0;
-    }
-    .step-subtitle {
-        font-size: 12.5px;
-        color: #6B7280;
-        margin-bottom: 10px;
-    }
-    .small-badge {
-        display: inline-block;
-        padding: 4px 9px;
-        border-radius: 6px;
-        background: #F7F9FC;
-        color: #1F4E78;
-        font-size: 12px;
-        font-weight: 600;
-        border: 1px solid #D9E2F3;
-    }
-    .audit-note {
-        padding: 9px 11px;
-        border-left: 3px solid #1F4E78;
-        background: #F7F9FC;
-        color: #374151;
-        font-size: 12.8px;
-        border-radius: 6px;
-        margin: 8px 0 10px 0;
-    }
-    .product-row {
-        border: 1px solid #E5E7EB;
-        border-radius: 10px;
-        padding: 9px 10px;
-        margin-bottom: 8px;
-        background: #FFFFFF;
-    }
-    .product-title {
-        font-weight: 700;
-        color: #17365D;
-        font-size: 14px;
-        line-height: 1.35;
-        margin-bottom: 4px;
-    }
-    .product-meta {
-        color: #4B5563;
-        font-size: 12px;
-        line-height: 1.45;
-    }
-    .preview-card {
-        border: 1px solid #E5E7EB;
-        border-radius: 10px;
-        padding: 14px;
-        background: #FFFFFF;
-    }
-    .preview-label {
-        color: #6B7280;
-        font-size: 12px;
-        margin-bottom: 2px;
-    }
-    .preview-value {
-        color: #111827;
-        font-size: 14px;
-        margin-bottom: 8px;
-    }
-    div[data-testid="metric-container"] {
-        background: #FAFAFA;
-        border: 1px solid #E5E7EB;
-        padding: 10px;
-        border-radius: 10px;
-    }
+    .main .block-container { padding-top: 2.2rem !important; padding-bottom: 2rem; max-width: 1360px; }
+    header[data-testid="stHeader"] { background: rgba(255,255,255,0.96); box-shadow: none; }
+    .topbar { border:1px solid #E5E7EB; border-radius:14px; padding:14px 16px; background:#FFFFFF; margin-bottom:12px; }
+    .title { font-size:24px; font-weight:780; color:#111827; line-height:1.3; }
+    .sub { font-size:13px; color:#6B7280; margin-top:4px; }
+    .section-title { font-size:16px; font-weight:750; color:#111827; margin: 2px 0 2px 0; }
+    .section-sub { font-size:12.5px; color:#6B7280; margin-bottom:8px; }
+    .note { color:#6B7280; font-size:12.5px; }
+    .card { border:1px solid #E5E7EB; border-radius:14px; padding:13px 14px; background:#FFFFFF; margin-bottom:12px; }
+    .label { color:#6B7280; font-size:12px; margin-bottom:2px; }
+    .value { color:#111827; font-size:14px; margin-bottom:8px; }
+    .safe-img-wrap { width:100%; display:flex; align-items:center; justify-content:center; overflow:hidden; border:1px solid #EEF0F3; border-radius:10px; background:#FAFAFA; }
+    .safe-img-wrap img { object-fit:contain; display:block; }
+    .safe-img-caption { color:#6B7280; font-size:11px; text-align:center; margin-top:3px; }
+    div[data-testid="metric-container"] { background:#FFFFFF; border:1px solid #E5E7EB; padding:9px 10px; border-radius:12px; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 
-def render_app_header(subtitle: str) -> None:
+def h(value: Any) -> str:
+    return html.escape(str(value or ""), quote=False)
+
+
+def clean_text(value: Any) -> str:
+    text = str(value or "").strip()
+    return "" if text.lower() in {"nan", "none", "null", "#n/a", "#name?", "#value!"} else text
+
+
+def num_text(value: Any, digits: int = 4) -> str:
+    try:
+        n = float(value or 0)
+        if n == 0:
+            return ""
+        return f"{n:.{digits}f}"
+    except Exception:
+        return clean_text(value)
+
+
+def qty_text(value: Any) -> str:
+    try:
+        n = float(value or 0)
+        if n == 0:
+            return ""
+        return str(int(n)) if n.is_integer() else f"{n:g}"
+    except Exception:
+        return clean_text(value)
+
+
+def split_sap_text(value: str) -> list[str]:
+    parts = re.split(r"[\s,，;；]+", str(value or "").strip())
+    result: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        p = part.strip()
+        if not p:
+            continue
+        key = p.lower()
+        if key not in seen:
+            result.append(p)
+            seen.add(key)
+    return result[:500]
+
+
+def render_topbar() -> None:
     st.markdown(
-        f"""
-        <div class="app-header">
-            <div class="app-title">外贸报价表自动生成系统</div>
-            <div class="app-subtitle">{subtitle}</div>
+        """
+        <div class="topbar">
+            <div class="title">LESSO 外贸报价系统</div>
+            <div class="sub">按真实报价流程设计：查产品 → 核图片/型号/价格 → 加入报价单 → 调价 → 导出 Excel / PDF。</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def cached_get_categories() -> list[str]:
+def section(title: str, subtitle: str = "") -> None:
+    st.markdown(f"<div class='section-title'>{h(title)}</div>", unsafe_allow_html=True)
+    if subtitle:
+        st.markdown(f"<div class='section-sub'>{h(subtitle)}</div>", unsafe_allow_html=True)
+
+
+def render_safe_image(image_url: str | None, width: int = 120, height: int | None = None, caption: str = "") -> None:
+    """Render image as browser HTML, so bad URLs will not crash Streamlit."""
+    url = str(image_url or "").strip()
+    if not url:
+        st.caption("无图片")
+        return
+    if not (url.startswith("http://") or url.startswith("https://") or url.startswith("data:image/")):
+        st.caption("图片路径异常")
+        return
+    h_px = int(height or width)
+    safe_url = html.escape(url, quote=True)
+    safe_caption = html.escape(caption or "", quote=False)
+    st.markdown(
+        f"""
+        <div class="safe-img-wrap" style="height:{h_px}px; min-height:{h_px}px;">
+            <img src="{safe_url}" style="max-width:{int(width)}px; max-height:{h_px - 8}px;" loading="lazy" referrerpolicy="no-referrer" />
+        </div>
+        {f'<div class="safe-img-caption">{safe_caption}</div>' if safe_caption else ''}
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+@st.cache_data(ttl=90, show_spinner=False)
+def cached_categories() -> list[str]:
     return get_categories()
 
 
-@st.cache_data(ttl=120, show_spinner=False)
-def cached_load_products(keyword: str, category: str, min_price: float | None, max_price: float | None, min_stock: int | None, limit: int) -> pd.DataFrame:
+@st.cache_data(ttl=90, show_spinner=False)
+def cached_products(keyword: str, sap_text: str, category: str, min_price: float | None, max_price: float | None, min_stock: int | None, has_image: bool, limit: int) -> pd.DataFrame:
     return load_products(
         keyword=keyword,
+        sap_list=split_sap_text(sap_text),
         category=category,
         min_price=min_price,
         max_price=max_price,
         min_stock=min_stock,
+        has_image=has_image,
         limit=limit,
     )
 
@@ -181,16 +179,16 @@ def cached_pdf_font_status() -> str:
 
 
 def clear_product_cache() -> None:
-    cached_get_categories.clear()
-    cached_load_products.clear()
+    cached_categories.clear()
+    cached_products.clear()
+
+
+def reset_export_cache() -> None:
+    st.session_state["export_files"] = {}
 
 
 def make_export_signature(items: pd.DataFrame, customer: str, quote_no: str, price_note: str) -> str:
-    cols = [
-        "sap", "category", "cn_name", "en_name", "model", "description",
-        "base_price", "quote_price", "quantity", "amount", "stock",
-        "packing_volume", "total_volume", "package_info", "image_url",
-    ]
+    cols = ["sap", "category", "cn_name", "en_name", "model", "description", "color", "size_mm", "weight", "material_description", "quote_price", "quantity", "amount", "stock", "packing_volume", "qty_per_ctn", "total_volume", "unit", "package_info", "image_url"]
     safe = items.copy()
     for col in cols:
         if col not in safe.columns:
@@ -199,20 +197,18 @@ def make_export_signature(items: pd.DataFrame, customer: str, quote_no: str, pri
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def safe_text(value: object) -> str:
-    return str(value or "").strip()
-
-
+# -----------------------------------------------------------------------------
+# Login
+# -----------------------------------------------------------------------------
 def login_page() -> None:
-    render_app_header("产品数据库 · 云端图片 · 价格筛选 · 报价购物车 · 中英双版本 Excel/PDF 导出")
-    c1, c2, c3 = st.columns([1, 1.1, 1])
+    render_topbar()
+    c1, c2, c3 = st.columns([1, 1.05, 1])
     with c2:
-        st.subheader("账号登录")
-        st.caption("正式使用请创建独立管理员账号，并停用默认 admin。")
+        st.subheader("登录")
         with st.form("login_form"):
             username = st.text_input("用户名")
             password = st.text_input("密码", type="password")
-            submitted = st.form_submit_button("登录", use_container_width=True)
+            submitted = st.form_submit_button("登录", type="primary", use_container_width=True)
         if submitted:
             user = authenticate(username, password)
             if user:
@@ -233,31 +229,37 @@ st.session_state.setdefault("cart", {})
 st.session_state.setdefault("export_files", {})
 st.session_state.setdefault("quote_no_default", f"QT-{datetime.now().strftime('%Y%m%d-%H%M')}")
 
-render_app_header("稳定云端版 · Supabase 数据库与图片 · A4 竖版中英报价单 · 点击生成文件")
+render_topbar()
+
 
 # -----------------------------------------------------------------------------
-# Sidebar
+# Sidebar / admin
 # -----------------------------------------------------------------------------
 with st.sidebar:
-    st.caption(f"当前数据库：{get_database_backend_name()}")
-    st.markdown(f"<span class='small-badge'>当前用户：{user['username']}｜{user['role']}</span>", unsafe_allow_html=True)
+    st.markdown(f"**{h(user['username'])}**｜{h(user['role'])}")
+    st.caption(f"数据库：{get_database_backend_name()}")
     st.caption(get_db_status())
     st.caption(cached_pdf_font_status())
+
     if st.button("退出登录", use_container_width=True):
         st.session_state.pop("user", None)
         st.session_state.pop("cart", None)
+        st.session_state.pop("export_files", None)
         st.rerun()
 
-    admin_panel_open = False
+    st.divider()
     if is_admin:
-        admin_panel_open = st.toggle("显示后台管理", value=False, help="平时关闭后台管理，可减少页面渲染并提升报价速度。")
+        admin_panel_open = st.toggle("后台管理", value=False, help="导入产品、上传图片、管理账号。平时报价建议关闭。")
+    else:
+        admin_panel_open = False
+        st.info("普通用户只能搜索产品、生成报价。")
 
     if is_admin and admin_panel_open:
-        st.divider()
-        st.header("后台管理员")
+        st.subheader("后台管理")
 
-        with st.expander("导入/更新产品数据库", expanded=True):
-            product_file = st.file_uploader("导入产品表 Excel/CSV", type=["xlsx", "xls", "csv"])
+        with st.expander("导入/更新产品表", expanded=True):
+            st.caption("支持两种导入：1）标准字段；2）PPR宽表字段 Grey SAP No. / Green SAP No. / Size(mm) / Weight / Pcs/Carton / L W H CBM。")
+            product_file = st.file_uploader("上传 Excel / CSV", type=["xlsx", "xls", "csv"])
             if product_file is not None:
                 try:
                     if product_file.name.lower().endswith(".csv"):
@@ -266,12 +268,15 @@ with st.sidebar:
                         df_import = pd.read_excel(product_file)
                     count = upsert_products(df_import)
                     clear_product_cache()
-                    st.success(f"已导入/更新 {count} 个产品")
-                except Exception as e:
-                    st.error(f"导入失败：{e}")
+                    reset_export_cache()
+                    st.success(f"已导入/更新 {count} 个产品。")
+                except Exception as exc:
+                    st.error(f"导入失败：{exc}")
 
+        with st.expander("批量上传产品图片", expanded=False):
+            st.caption("图片名建议为 SAP号.png。系统会上传到 Supabase Storage，并写入 products.image_url。")
             image_files = st.file_uploader(
-                "批量上传产品图片到 Supabase Storage，文件名建议为 SAP号.png；SAP号_副本.png 可自动识别",
+                "选择图片文件",
                 type=["jpg", "jpeg", "png", "webp"],
                 accept_multiple_files=True,
             )
@@ -279,69 +284,97 @@ with st.sidebar:
                 try:
                     count = save_uploaded_images(image_files)
                     clear_product_cache()
-                    st.success(f"已上传并绑定 {count} 张图片到云端。")
-                except Exception as e:
-                    st.error(f"图片上传失败：{e}")
+                    reset_export_cache()
+                    st.success(f"已上传并绑定 {count} 张图片。")
+                except Exception as exc:
+                    st.error(f"图片上传失败：{exc}")
 
-        with st.expander("手工新增/修改商品"):
-            with st.form("single_product_form"):
-                sap = st.text_input("SAP号 *")
-                category_new = st.text_input("分类")
-                cn_name = st.text_input("中文品名")
-                en_name = st.text_input("英文品名")
-                model = st.text_input("型号")
-                description = st.text_area("描述", height=70)
-                c1, c2 = st.columns(2)
-                price = c1.number_input("价格", min_value=0.0, step=0.01, format="%.4f")
-                stock = c2.number_input("库存", min_value=0, step=1)
-                c3, c4 = st.columns(2)
-                packing_volume = c3.number_input("包装体积 CBM/件", min_value=0.0, step=0.0001, format="%.4f")
-                unit = c4.text_input("单位", value="PC")
-                c5, c6 = st.columns(2)
-                currency = c5.text_input("币种", value="USD")
-                active = c6.selectbox("状态", [1, 0], format_func=lambda x: "启用" if x == 1 else "隐藏")
-                package_info = st.text_input("包装信息")
-                image_url = st.text_input("图片URL（可选，Supabase Storage public URL）")
-                submitted = st.form_submit_button("保存商品", use_container_width=True)
-            if submitted:
+        with st.expander("手工新增/修改商品", expanded=False):
+            with st.form("single_product_form", clear_on_submit=False):
+                sap = st.text_input("sap *")
+                category_new = st.text_input("category 分类")
+                cn_name = st.text_input("cn_name 中文品名")
+                en_name = st.text_input("en_name 英文品名", value="")
+                model = st.text_input("model / size 型号规格")
+                description = st.text_area("description 描述", height=70)
+                c1, c2, c3, c4 = st.columns(4)
+                color = c1.text_input("color 颜色", value="")
+                size_mm = c2.text_input("size_mm 规格", value="")
+                weight = c3.number_input("weight kg/m or pc", min_value=0.0, step=0.001, format="%.4f")
+                qty_per_ctn = c4.number_input("Qty/CTN", min_value=0.0, step=1.0, format="%.0f")
+                p1, p2, p3, p4 = st.columns(4)
+                price = p1.number_input("price USD", min_value=0.0, step=0.01, format="%.4f")
+                price_cny = p2.number_input("price CNY", min_value=0.0, step=0.01, format="%.4f")
+                stock = p3.number_input("stock 库存", min_value=0, step=1)
+                packing_volume = p4.number_input("packing_volume CBM", min_value=0.0, step=0.0001, format="%.4f")
+                d1, d2, d3 = st.columns(3)
+                package_length = d1.number_input("L", min_value=0.0, step=0.01, format="%.4f")
+                package_width = d2.number_input("W", min_value=0.0, step=0.01, format="%.4f")
+                package_height = d3.number_input("H", min_value=0.0, step=0.01, format="%.4f")
+                c4, c5, c6 = st.columns(3)
+                unit = c4.text_input("unit 单位", value="PC")
+                currency = c5.text_input("currency 币种", value="USD")
+                active = c6.selectbox("active 状态", [1, 0], format_func=lambda x: "启用" if x == 1 else "隐藏")
+                material_description = st.text_input("material_description 物料描述")
+                package_info = st.text_input("package_info 包装信息")
+                image_url = st.text_input("image_url 图片URL/文件名", help="可填完整 URL，也可填 8110010814.png。")
+                submitted_single = st.form_submit_button("保存商品", type="primary", use_container_width=True)
+
+            if submitted_single:
                 if not sap.strip():
-                    st.error("SAP号不能为空。")
+                    st.error("sap 不能为空。")
                 else:
-                    one = pd.DataFrame([{
-                        "sap": sap,
-                        "category": category_new,
-                        "cn_name": cn_name,
-                        "en_name": en_name,
-                        "model": model,
-                        "description": description,
-                        "price": price,
-                        "stock": stock,
-                        "packing_volume": packing_volume,
-                        "unit": unit,
-                        "currency": currency,
-                        "package_info": package_info,
-                        "image_url": image_url,
-                        "active": active,
-                    }])
+                    one = pd.DataFrame([
+                        {
+                            "sap": sap,
+                            "category": category_new,
+                            "cn_name": cn_name,
+                            "en_name": en_name,
+                            "model": model,
+                            "description": description,
+                            "color": color,
+                            "size_mm": size_mm,
+                            "weight": weight,
+                            "material_description": material_description,
+                            "price": price,
+                            "price_cny": price_cny,
+                            "stock": stock,
+                            "packing_volume": packing_volume,
+                            "qty_per_ctn": qty_per_ctn,
+                            "package_length": package_length,
+                            "package_width": package_width,
+                            "package_height": package_height,
+                            "unit": unit,
+                            "currency": currency,
+                            "package_info": package_info,
+                            "image_url": image_url,
+                            "active": active,
+                        }
+                    ])
                     upsert_products(one)
                     clear_product_cache()
+                    reset_export_cache()
                     st.success("商品已保存。")
 
-        with st.expander("删除商品"):
-            del_sap = st.text_input("输入要删除的 SAP 号")
+        with st.expander("删除商品 / 账号管理", expanded=False):
+            del_sap = st.text_input("删除 SAP")
             if st.button("删除该商品", use_container_width=True):
                 if del_sap.strip() and delete_product(del_sap.strip()):
                     clear_product_cache()
+                    st.session_state.cart.pop(del_sap.strip(), None)
+                    reset_export_cache()
                     st.success("已删除商品。")
                 else:
                     st.warning("没有找到该商品。")
 
-        with st.expander("账号管理"):
-            users_df = list_users()
-            st.dataframe(users_df, hide_index=True, use_container_width=True)
+            st.divider()
+            if st.button("显示用户列表", use_container_width=True):
+                st.session_state["show_users_table"] = True
+            if st.session_state.get("show_users_table"):
+                st.dataframe(list_users(), hide_index=True, use_container_width=True)
             with st.form("create_user_form"):
-                new_user = st.text_input("新用户名")
-                new_password = st.text_input("新密码", type="password")
+                new_user = st.text_input("用户名")
+                new_password = st.text_input("密码", type="password")
                 new_role = st.selectbox("权限", ["user", "admin"], format_func=lambda x: "普通用户" if x == "user" else "管理员")
                 create_user_submitted = st.form_submit_button("创建/重置账号", use_container_width=True)
             if create_user_submitted:
@@ -351,273 +384,226 @@ with st.sidebar:
                     create_or_update_user(new_user.strip(), hash_password(new_password), role=new_role, active=1)
                     st.success("账号已创建/重置。")
             disable_user = st.text_input("停用/启用用户名")
-            dc1, dc2 = st.columns(2)
-            if dc1.button("停用", use_container_width=True):
+            u1, u2 = st.columns(2)
+            if u1.button("停用", use_container_width=True):
                 if disable_user.strip():
                     set_user_active(disable_user.strip(), 0)
                     st.success("已停用。")
-            if dc2.button("启用", use_container_width=True):
+            if u2.button("启用", use_container_width=True):
                 if disable_user.strip():
                     set_user_active(disable_user.strip(), 1)
                     st.success("已启用。")
-    elif not is_admin:
-        st.info("普通用户权限：只能筛选产品并生成报价表，不能新增、修改或删除商品。")
+
 
 # -----------------------------------------------------------------------------
-# Product filter
+# Search
 # -----------------------------------------------------------------------------
-st.markdown("<div class='step-title'>1. 产品筛选与图片确认</div>", unsafe_allow_html=True)
-st.markdown(
-    "<div class='step-subtitle'>输入筛选条件后点击查询。选品和数量在表单内批量提交，避免每勾选一次就重跑页面。</div>",
-    unsafe_allow_html=True,
-)
+section("1. 查找产品", "真实报价常用三种方式：按关键词搜、粘贴客户 SAP 清单、按分类浏览。")
 
-if "filter_state" not in st.session_state:
-    st.session_state["filter_state"] = {
-        "keyword": "",
-        "category": "全部",
-        "result_limit": 20,
-        "min_price": 0.0,
-        "max_price": 0.0,
-        "min_stock": 0,
-        "show_images": True,
-    }
+with st.form("search_form"):
+    r1c1, r1c2, r1c3 = st.columns([1.4, 1.2, 0.9])
+    keyword = r1c1.text_input("关键词", placeholder="例：角阀 DN15 / 水龙头 / W13101B / 806005")
+    sap_text = r1c2.text_area("批量 SAP 精确查询", placeholder="客户发来一串 SAP 时粘贴到这里，空格/逗号/换行均可", height=68)
+    category = r1c3.selectbox("分类", cached_categories())
 
-category_options = cached_get_categories()
-if st.session_state["filter_state"].get("category", "全部") not in category_options:
-    st.session_state["filter_state"]["category"] = "全部"
+    r2c1, r2c2, r2c3, r2c4, r2c5 = st.columns([0.85, 0.85, 0.8, 0.75, 0.75])
+    min_price_raw = r2c1.number_input("最低价 USD", min_value=0.0, value=0.0, step=0.1)
+    max_price_raw = r2c2.number_input("最高价 USD", min_value=0.0, value=0.0, step=0.1, help="0 表示不限")
+    min_stock_raw = r2c3.number_input("最低库存", min_value=0, value=0, step=1)
+    has_image = r2c4.checkbox("只看有图", value=False)
+    limit = r2c5.selectbox("显示数量", [20, 50, 100, 200], index=1)
 
-with st.container(border=True):
-    with st.form("product_filter_form"):
-        f1, f2, f3 = st.columns([1.55, 1, 0.95])
-        keyword_input = f1.text_input(
-            "搜索 SAP / 中文名 / 英文名 / 型号 / 描述",
-            value=st.session_state["filter_state"].get("keyword", ""),
-        )
-        category_input = f2.selectbox(
-            "分类",
-            category_options,
-            index=category_options.index(st.session_state["filter_state"].get("category", "全部")),
-        )
-        limit_options = [10, 20, 50, 100]
-        current_limit = int(st.session_state["filter_state"].get("result_limit", 20))
-        if current_limit not in limit_options:
-            current_limit = 20
-        result_limit_input = f3.selectbox("最多显示", limit_options, index=limit_options.index(current_limit))
+    submitted_search = st.form_submit_button("查询产品", type="primary", use_container_width=True)
 
-        f4, f5, f6, f7 = st.columns([1, 1, 1, 0.8])
-        min_price_input = f4.number_input("不低于价格", min_value=0.0, value=float(st.session_state["filter_state"].get("min_price", 0.0)), step=0.1)
-        max_price_input_form = f5.number_input("不高于价格，0 表示不限", min_value=0.0, value=float(st.session_state["filter_state"].get("max_price", 0.0)), step=0.1)
-        min_stock_input_form = f6.number_input("最低库存", min_value=0, value=int(st.session_state["filter_state"].get("min_stock", 0)), step=1)
-        show_images_input = f7.checkbox("显示图片", value=bool(st.session_state["filter_state"].get("show_images", True)))
-        submitted_filter = st.form_submit_button("查询 / 刷新产品", type="primary", use_container_width=True)
+min_price = min_price_raw if min_price_raw > 0 else None
+max_price = max_price_raw if max_price_raw > 0 else None
+min_stock = min_stock_raw if min_stock_raw > 0 else None
 
-    if submitted_filter:
-        st.session_state["filter_state"] = {
-            "keyword": keyword_input,
-            "category": category_input,
-            "result_limit": int(result_limit_input),
-            "min_price": float(min_price_input),
-            "max_price": float(max_price_input_form),
-            "min_stock": int(min_stock_input_form),
-            "show_images": bool(show_images_input),
-        }
+products = cached_products(keyword, sap_text, category, min_price, max_price, min_stock, has_image, int(limit))
 
-filter_state = st.session_state["filter_state"]
-keyword = filter_state["keyword"]
-category = filter_state["category"]
-result_limit = int(filter_state["result_limit"])
-min_price = float(filter_state["min_price"])
-max_price_input = float(filter_state["max_price"])
-min_stock_input = int(filter_state["min_stock"])
-show_images = bool(filter_state.get("show_images", True))
+st.caption(f"当前结果：{len(products)} 条｜购物车：{len(st.session_state.cart)} 个 SKU")
 
-products = cached_load_products(
-    keyword=keyword,
-    category=category,
-    min_price=min_price if min_price > 0 else None,
-    max_price=max_price_input if max_price_input > 0 else None,
-    min_stock=min_stock_input if min_stock_input > 0 else None,
-    limit=result_limit,
-)
 
-status_cols = st.columns(4)
-status_cols[0].metric("当前显示", len(products))
-status_cols[1].metric("购物车 SKU", len(st.session_state.cart))
-status_cols[2].metric("筛选分类", category)
-status_cols[3].metric("显示上限", result_limit)
-
-st.markdown(
-    "<div class='audit-note'>准确性原则：所有加入购物车的产品都按 SAP 从当前查询结果重新读取完整字段；选品表单只提交“是否加入”和“数量”，避免隐藏字段被误改。</div>",
-    unsafe_allow_html=True,
-)
+# -----------------------------------------------------------------------------
+# Product selection
+# -----------------------------------------------------------------------------
+section("2. 选择产品", "先看左侧表格批量加入；不确定时看右侧“加入前确认”。")
 
 if products.empty:
-    st.info("暂无产品。管理员可以在左侧导入产品表，普通用户需要等待管理员维护数据库。")
+    st.info("没有匹配产品。可以减少条件，或检查产品表是否已导入。")
 else:
-    st.markdown("<div class='step-title'>2. 勾选产品并加入报价单</div>", unsafe_allow_html=True)
-    table_col, confirm_col = st.columns([2.25, 1.05], gap="large")
+    results_col, preview_col = st.columns([2.15, 0.85], gap="large")
 
-    with table_col:
-        with st.form("product_selection_form"):
-            for idx, row in products.iterrows():
-                sap_key = safe_text(row.get("sap"))
-                image_url = safe_text(row.get("image_url"))
-                name_cn = safe_text(row.get("cn_name"))
-                name_en = safe_text(row.get("en_name"))
-                model = safe_text(row.get("model"))
-                category_value = safe_text(row.get("category"))
-                price_value = float(row.get("price") or 0)
-                stock_value = int(row.get("stock") or 0)
-                cbm_value = float(row.get("packing_volume") or 0)
-                currency = safe_text(row.get("currency")) or "USD"
-                default_qty = max(int(st.session_state.cart.get(sap_key, {}).get("quantity", 1)), 1)
+    product_map = {clean_text(row.get("sap")): row.to_dict() for _, row in products.iterrows()}
 
-                st.markdown("<div class='product-row'>", unsafe_allow_html=True)
-                c_img, c_info, c_num, c_qty, c_sel = st.columns([0.75, 3.1, 1.1, 0.9, 0.75], vertical_alignment="center")
-                with c_img:
-                    if show_images and image_url:
-                        st.image(image_url, width=92)
-                    else:
-                        st.caption("无图" if not image_url else "图片关闭")
-                with c_info:
-                    st.markdown(f"<div class='product-title'>{name_cn or name_en or sap_key}</div>", unsafe_allow_html=True)
-                    st.markdown(
-                        f"<div class='product-meta'>SAP：{sap_key}｜型号：{model or '-'}｜分类：{category_value or '-'}<br/>英文：{name_en or '-'}</div>",
-                        unsafe_allow_html=True,
-                    )
-                with c_num:
-                    st.markdown(f"<div class='product-meta'>价格<br/><b>{price_value:.2f} {currency}</b></div>", unsafe_allow_html=True)
-                    st.markdown(f"<div class='product-meta'>库存：{stock_value}<br/>CBM：{cbm_value:.4f}</div>", unsafe_allow_html=True)
-                with c_qty:
-                    st.number_input("数量", min_value=1, value=default_qty, step=1, key=f"qty_select_{sap_key}", label_visibility="collapsed")
-                with c_sel:
-                    st.checkbox("加入", value=sap_key in st.session_state.cart, key=f"sel_select_{sap_key}")
-                st.markdown("</div>", unsafe_allow_html=True)
+    with results_col:
+        edit_df = products.copy()
+        edit_df["image_preview"] = edit_df.apply(lambda r: resolve_image_url(r.get("image_url"), str(r.get("sap", ""))), axis=1)
+        edit_df["select"] = edit_df["sap"].astype(str).apply(lambda x: x in st.session_state.cart)
+        edit_df["quantity"] = edit_df["sap"].astype(str).apply(lambda x: int(st.session_state.cart.get(x, {}).get("quantity", 1)))
 
-            submitted_add = st.form_submit_button("加入/更新已勾选产品", type="primary", use_container_width=True)
+        display_cols = ["select", "image_preview", "sap", "category", "cn_name", "model", "color", "size_mm", "description", "price", "stock", "packing_volume", "qty_per_ctn", "unit", "quantity"]
+        for col in display_cols:
+            if col not in edit_df.columns:
+                edit_df[col] = ""
 
-        if submitted_add:
-            added = 0
-            for _, row in products.iterrows():
-                sap_key = safe_text(row.get("sap"))
-                if not sap_key:
-                    continue
-                if bool(st.session_state.get(f"sel_select_{sap_key}", False)):
-                    item = row.to_dict()
-                    item["quantity"] = max(int(st.session_state.get(f"qty_select_{sap_key}", 1) or 1), 1)
-                    st.session_state.cart[sap_key] = item
-                    added += 1
-            if added:
-                st.success(f"已加入/更新 {added} 个产品。")
-            else:
+        with st.form("product_select_form"):
+            edited_products = st.data_editor(
+                edit_df[display_cols],
+                hide_index=True,
+                use_container_width=True,
+                height=430,
+                disabled=["image_preview", "sap", "category", "cn_name", "model", "color", "size_mm", "description", "price", "stock", "packing_volume", "qty_per_ctn", "unit"],
+                column_config={
+                    "select": st.column_config.CheckboxColumn("选", width="small"),
+                    "image_preview": st.column_config.ImageColumn("图片", width="small"),
+                    "sap": st.column_config.TextColumn("SAP", width="medium"),
+                    "category": st.column_config.TextColumn("分类", width="medium"),
+                    "cn_name": st.column_config.TextColumn("品名", width="large"),
+                    "model": st.column_config.TextColumn("型号", width="medium"),
+                    "color": st.column_config.TextColumn("颜色", width="small"),
+                    "size_mm": st.column_config.TextColumn("规格", width="small"),
+                    "description": st.column_config.TextColumn("描述", width="large"),
+                    "price": st.column_config.NumberColumn("价格 USD", format="%.4f", width="small"),
+                    "stock": st.column_config.NumberColumn("库存", width="small"),
+                    "packing_volume": st.column_config.NumberColumn("CBM/件", format="%.4f", width="small"),
+                    "qty_per_ctn": st.column_config.NumberColumn("Qty/CTN", format="%.0f", width="small"),
+                    "unit": st.column_config.TextColumn("单位", width="small"),
+                    "quantity": st.column_config.NumberColumn("数量", min_value=1, step=1, width="small"),
+                },
+                key="product_editor",
+            )
+            add_selected = st.form_submit_button("加入/更新已选产品", type="primary", use_container_width=True)
+
+        if add_selected:
+            selected = edited_products[edited_products["select"] == True].copy()
+            if selected.empty:
                 st.warning("请先勾选产品。")
+            else:
+                added = 0
+                for _, row in selected.iterrows():
+                    sap_key = clean_text(row.get("sap"))
+                    base = product_map.get(sap_key)
+                    if not base:
+                        continue
+                    base["quantity"] = max(int(row.get("quantity") or 1), 1)
+                    st.session_state.cart[sap_key] = base
+                    added += 1
+                reset_export_cache()
+                st.success(f"已加入/更新 {added} 个产品。")
 
-    with confirm_col:
-        st.markdown("<div class='step-title'>加入前确认</div>", unsafe_allow_html=True)
-        st.markdown("<div class='step-subtitle'>用于核对图片、品名、型号、价格、库存和体积。</div>", unsafe_allow_html=True)
+    with preview_col:
+        section("加入前确认", "核对图片、型号、描述和价格。")
         preview_options = products.copy()
         preview_options["preview_label"] = preview_options.apply(
-            lambda r: f"{r.get('sap', '')} | {r.get('cn_name', '') or r.get('en_name', '')} | {r.get('model', '')}",
-            axis=1,
+            lambda r: f"{clean_text(r.get('sap'))} | {clean_text(r.get('cn_name'))} | {clean_text(r.get('model'))} | {clean_text(r.get('color'))}", axis=1
         )
-        selected_preview = st.selectbox("选择产品", preview_options["preview_label"].tolist(), key="preview_product_select")
+        selected_preview = st.selectbox("选择产品", preview_options["preview_label"].tolist(), key="preview_select")
         if selected_preview:
             preview_sap = selected_preview.split(" | ")[0]
             preview_row = preview_options[preview_options["sap"].astype(str) == preview_sap].iloc[0]
-            p_img = safe_text(preview_row.get("image_url"))
-            st.markdown("<div class='preview-label'>产品图片</div>", unsafe_allow_html=True)
-            if p_img:
-                st.image(p_img, caption=f"SAP: {preview_row.get('sap', '')}", width=250)
-            else:
-                st.info("该产品暂未上传图片。")
-
-            st.markdown("<div class='preview-card'>", unsafe_allow_html=True)
-            st.markdown(f"<div class='preview-label'>中文品名</div><div class='preview-value'>{preview_row.get('cn_name', '')}</div>", unsafe_allow_html=True)
-            st.markdown(f"<div class='preview-label'>英文品名</div><div class='preview-value'>{preview_row.get('en_name', '')}</div>", unsafe_allow_html=True)
-            st.markdown(f"<div class='preview-label'>型号</div><div class='preview-value'>{preview_row.get('model', '')}</div>", unsafe_allow_html=True)
-            st.markdown(f"<div class='preview-label'>基础价格</div><div class='preview-value'>{preview_row.get('price', 0)} {preview_row.get('currency', 'USD')}</div>", unsafe_allow_html=True)
-            st.markdown(f"<div class='preview-label'>库存</div><div class='preview-value'>{preview_row.get('stock', 0)}</div>", unsafe_allow_html=True)
-            st.markdown(f"<div class='preview-label'>包装体积</div><div class='preview-value'>{preview_row.get('packing_volume', 0)} CBM/件</div>", unsafe_allow_html=True)
-            st.markdown("</div>", unsafe_allow_html=True)
-
-            preview_qty = st.number_input(
-                "加入数量",
-                min_value=1,
-                value=max(int(st.session_state.cart.get(safe_text(preview_row.get("sap")), {}).get("quantity", 1)), 1),
-                step=1,
-                key="preview_qty",
+            p_img = resolve_image_url(preview_row.get("image_url"), preview_sap)
+            render_safe_image(p_img, width=260, height=220, caption=f"SAP: {preview_sap}" if p_img else "")
+            st.markdown(
+                f"""
+                <div class="card">
+                    <div class="label">分类</div><div class="value">{h(preview_row.get('category'))}</div>
+                    <div class="label">品名</div><div class="value">{h(preview_row.get('cn_name'))}</div>
+                    <div class="label">型号 / 规格 / 颜色</div><div class="value">{h(preview_row.get('model'))} ｜ {h(preview_row.get('size_mm'))} ｜ {h(preview_row.get('color'))}</div>
+                    <div class="label">描述</div><div class="value">{h(preview_row.get('description'))}</div>
+                    <div class="label">重量 / Qty/CTN</div><div class="value">{qty_text(preview_row.get('weight')) or '-'} kg/m or pc ｜ {qty_text(preview_row.get('qty_per_ctn')) or '-'}</div>
+                    <div class="label">价格 / 库存 / 体积</div><div class="value">{float(preview_row.get('price') or 0):.4f} USD ｜ {int(float(preview_row.get('stock') or 0))} ｜ {float(preview_row.get('packing_volume') or 0):.4f} CBM</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
             )
-            if st.button("加入当前确认产品", use_container_width=True):
+            with st.form("preview_add_form"):
+                pq = st.number_input("加入数量", min_value=1, value=max(int(st.session_state.cart.get(preview_sap, {}).get("quantity", 1)), 1), step=1)
+                add_one = st.form_submit_button("加入当前确认产品", use_container_width=True)
+            if add_one:
                 item = preview_row.to_dict()
-                sap_key = safe_text(item.get("sap"))
-                item["quantity"] = int(preview_qty)
-                st.session_state.cart[sap_key] = item
-                st.success(f"已加入：{sap_key}")
+                item["quantity"] = int(pq)
+                st.session_state.cart[preview_sap] = item
+                reset_export_cache()
+                st.success(f"已加入：{preview_sap}")
+
 
 # -----------------------------------------------------------------------------
 # Cart
 # -----------------------------------------------------------------------------
-st.subheader("3. 报价单购物车")
+section("3. 报价购物车", "集中修改数量，确认后进入报价规则。")
 cart = st.session_state.cart
 if not cart:
-    st.warning("报价单为空。请先从上方筛选结果中勾选产品并加入报价单。")
+    st.warning("报价单为空。请先加入产品。")
     st.stop()
 
 cart_df = pd.DataFrame(list(cart.values()))
-cart_view_cols = ["sap", "category", "cn_name", "en_name", "model", "price", "quantity", "stock", "packing_volume", "unit", "currency", "package_info", "image_url"]
-for c in cart_view_cols:
-    if c not in cart_df.columns:
-        cart_df[c] = ""
+cart_cols = ["sap", "category", "cn_name", "en_name", "model", "description", "color", "size_mm", "weight", "material_description", "price", "price_cny", "quantity", "stock", "packing_volume", "qty_per_ctn", "package_length", "package_width", "package_height", "unit", "currency", "package_info", "image_url"]
+for col in cart_cols:
+    if col not in cart_df.columns:
+        cart_df[col] = ""
+cart_editor = cart_df[cart_cols].copy()
+cart_editor["quantity"] = pd.to_numeric(cart_editor["quantity"], errors="coerce").fillna(1).astype(int)
+cart_editor.insert(0, "remove", False)
 
-with st.form("cart_update_form"):
-    for _, row in cart_df.iterrows():
-        sap_key = safe_text(row.get("sap"))
-        c0, c1, c2, c3, c4, c5 = st.columns([0.8, 2.6, 1.2, 0.9, 0.9, 0.7], vertical_alignment="center")
-        with c0:
-            image_url = safe_text(row.get("image_url"))
-            if image_url:
-                st.image(image_url, width=64)
-            else:
-                st.caption("无图")
-        with c1:
-            st.markdown(f"**{safe_text(row.get('cn_name')) or safe_text(row.get('en_name')) or sap_key}**")
-            st.caption(f"SAP: {sap_key}｜型号: {safe_text(row.get('model')) or '-'}｜分类: {safe_text(row.get('category')) or '-'}")
-        with c2:
-            st.write(f"基础价：{float(row.get('price') or 0):.2f} {safe_text(row.get('currency')) or 'USD'}")
-            st.caption(f"库存：{int(row.get('stock') or 0)}")
-        with c3:
-            st.number_input("数量", min_value=1, value=max(int(row.get("quantity") or 1), 1), step=1, key=f"cart_qty_{sap_key}", label_visibility="collapsed")
-        with c4:
-            st.caption(f"CBM/件：{float(row.get('packing_volume') or 0):.4f}")
-        with c5:
-            st.checkbox("删除", value=False, key=f"cart_remove_{sap_key}")
-    cart_submitted = st.form_submit_button("更新购物车数量/删除", use_container_width=True)
+with st.form("cart_form"):
+    edited_cart = st.data_editor(
+        cart_editor[["remove", "sap", "category", "cn_name", "model", "color", "size_mm", "price", "quantity", "stock", "packing_volume", "qty_per_ctn", "unit", "package_info"]],
+        hide_index=True,
+        use_container_width=True,
+        height=260,
+        disabled=["sap", "category", "cn_name", "model", "color", "size_mm", "price", "stock", "packing_volume", "qty_per_ctn", "unit", "package_info"],
+        column_config={
+            "remove": st.column_config.CheckboxColumn("删", width="small"),
+            "sap": st.column_config.TextColumn("SAP", width="medium"),
+            "category": st.column_config.TextColumn("分类", width="medium"),
+            "cn_name": st.column_config.TextColumn("品名", width="large"),
+            "model": st.column_config.TextColumn("型号", width="medium"),
+            "color": st.column_config.TextColumn("颜色", width="small"),
+            "size_mm": st.column_config.TextColumn("规格", width="small"),
+            "price": st.column_config.NumberColumn("单价 USD", format="%.4f", width="small"),
+            "quantity": st.column_config.NumberColumn("数量", min_value=1, step=1, width="small"),
+            "stock": st.column_config.NumberColumn("库存", width="small"),
+            "packing_volume": st.column_config.NumberColumn("CBM/件", format="%.4f", width="small"),
+            "qty_per_ctn": st.column_config.NumberColumn("Qty/CTN", format="%.0f", width="small"),
+        },
+        key="cart_editor",
+    )
+    c1, c2 = st.columns([1, 1])
+    update_cart = c1.form_submit_button("更新购物车", type="primary", use_container_width=True)
+    clear_cart = c2.form_submit_button("清空购物车", use_container_width=True)
 
-if cart_submitted:
-    for sap_key in list(st.session_state.cart.keys()):
-        if bool(st.session_state.get(f"cart_remove_{sap_key}", False)):
+if update_cart:
+    for _, row in edited_cart.iterrows():
+        sap_key = clean_text(row.get("sap"))
+        if bool(row.get("remove")):
             st.session_state.cart.pop(sap_key, None)
         elif sap_key in st.session_state.cart:
-            st.session_state.cart[sap_key]["quantity"] = max(int(st.session_state.get(f"cart_qty_{sap_key}", 1) or 1), 1)
-    st.success("报价单已更新。")
+            st.session_state.cart[sap_key]["quantity"] = max(int(row.get("quantity") or 1), 1)
+    reset_export_cache()
+    st.success("购物车已更新。")
     st.rerun()
 
-b1, b2, b3 = st.columns([1, 1, 4])
-if b1.button("清空报价单", use_container_width=True):
+if clear_cart:
     st.session_state.cart = {}
+    reset_export_cache()
     st.rerun()
 
+
 # -----------------------------------------------------------------------------
-# Quote rules and export
+# Quote and export
 # -----------------------------------------------------------------------------
-st.subheader("4. 报价规则与导出")
-with st.container(border=True):
-    c1, c2, c3, c4 = st.columns([1, 1, 1.2, 1.2])
-    mode = c1.selectbox("价格模式", ["原价", "加点", "打折"])
-    percent = c2.number_input("比例 %", min_value=0.0, max_value=100.0, value=0.0, step=0.5)
-    customer = c3.text_input("客户名称", value="")
-    quote_no = c4.text_input("报价单号", value=st.session_state["quote_no_default"], key="quote_no_input")
+section("4. 报价规则与导出", "导出 Excel 时图片会嵌入表格图片列。")
+with st.form("quote_rule_form"):
+    q1, q2, q3, q4 = st.columns([0.9, 0.8, 1.2, 1.2])
+    mode = q1.selectbox("价格模式", ["原价", "加点", "打折"])
+    percent = q2.number_input("比例 %", min_value=0.0, max_value=100.0, value=0.0, step=0.5)
+    customer = q3.text_input("客户名称", value="")
+    quote_no = q4.text_input("报价单号", value=st.session_state["quote_no_default"])
+    apply_rule = st.form_submit_button("更新报价预览", type="primary", use_container_width=True)
+
+if apply_rule:
+    reset_export_cache()
 
 rule = PriceRule(mode=mode, percent=percent)
 items_raw = pd.DataFrame(list(st.session_state.cart.values()))
@@ -626,86 +612,49 @@ summary = quote_summary(items)
 price_note = f"{mode} {percent:.2f}%" if mode != "原价" else "原价 / Original Price"
 
 m1, m2, m3, m4 = st.columns(4)
-m1.metric("SKU数量", summary["sku_count"])
+m1.metric("SKU", summary["sku_count"])
 m2.metric("总数量", summary["total_qty"])
-m3.metric("总金额(USD)", f"{summary['total_amount']:.2f}")
+m3.metric("总金额 USD", f"{summary['total_amount']:.2f}")
 m4.metric("总体积 CBM", f"{summary['total_volume']:.4f}")
 
-st.subheader("5. 报价预览")
-st.caption("英文版 Excel/PDF 的产品名称列会优先引用英文品名 en_name；如果该字段为空，才会回退到中文品名。")
-preview_cols = ["sap", "category", "cn_name", "en_name", "model", "base_price", "quote_price", "quantity", "amount", "stock", "packing_volume", "total_volume"]
+preview_cols = ["sap", "category", "cn_name", "model", "color", "size_mm", "weight", "quote_price", "quantity", "amount", "stock", "packing_volume", "qty_per_ctn", "total_volume", "unit", "package_info"]
 for col in preview_cols:
     if col not in items.columns:
         items[col] = ""
-st.dataframe(items[preview_cols], use_container_width=True, hide_index=True)
-
-current_export_signature = make_export_signature(items, customer, quote_no, price_note)
-if st.session_state.get("export_signature") != current_export_signature:
-    st.session_state["export_signature"] = current_export_signature
-    st.session_state["export_files"] = {}
+st.dataframe(items[preview_cols], use_container_width=True, hide_index=True, height=245)
 
 if st.button("保存报价历史", use_container_width=True):
     save_quote_history(quote_no, customer, summary["total_amount"], created_by=user["username"])
     st.success("已保存报价历史。")
 
-st.markdown("#### 6. 生成下载文件")
-st.caption("系统不会在每次页面刷新时自动生成 PDF/Excel。需要哪个文件，就点击对应按钮生成。")
-export_files = st.session_state.setdefault("export_files", {})
+signature = make_export_signature(items, customer, quote_no, price_note)
+export_state = st.session_state["export_files"]
+if export_state.get("signature") != signature:
+    st.session_state["export_files"] = {"signature": signature}
+    export_state = st.session_state["export_files"]
 
-g1, g2, g3, g4 = st.columns(4)
-with g1:
+e1, e2, e3, e4 = st.columns(4)
+with e1:
     if st.button("生成中文 Excel", use_container_width=True):
         with st.spinner("正在生成中文 Excel..."):
-            export_files["excel_zh"] = export_quote_excel(items, customer, quote_no, price_note, lang="zh")
-with g2:
+            export_state["excel_zh"] = export_quote_excel(items, customer, quote_no, price_note, lang="zh")
+    if "excel_zh" in export_state:
+        st.download_button("下载中文 Excel", export_state["excel_zh"], file_name=f"{quote_no}_中文报价单.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+with e2:
     if st.button("生成英文 Excel", use_container_width=True):
         with st.spinner("正在生成英文 Excel..."):
-            export_files["excel_en"] = export_quote_excel(items, customer, quote_no, price_note, lang="en")
-with g3:
+            export_state["excel_en"] = export_quote_excel(items, customer, quote_no, price_note, lang="en")
+    if "excel_en" in export_state:
+        st.download_button("下载英文 Excel", export_state["excel_en"], file_name=f"{quote_no}_English_Quotation.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+with e3:
     if st.button("生成中文 PDF", use_container_width=True):
         with st.spinner("正在生成中文 PDF..."):
-            export_files["pdf_zh"] = export_quote_pdf(items, customer, quote_no, price_note, lang="zh")
-with g4:
+            export_state["pdf_zh"] = export_quote_pdf(items, customer, quote_no, price_note, lang="zh")
+    if "pdf_zh" in export_state:
+        st.download_button("下载中文 PDF", export_state["pdf_zh"], file_name=f"{quote_no}_中文报价单.pdf", mime="application/pdf", use_container_width=True)
+with e4:
     if st.button("生成英文 PDF", use_container_width=True):
         with st.spinner("正在生成英文 PDF..."):
-            export_files["pdf_en"] = export_quote_pdf(items, customer, quote_no, price_note, lang="en")
-
-st.session_state["export_files"] = export_files
-
-d1, d2, d3, d4 = st.columns(4)
-with d1:
-    if "excel_zh" in export_files:
-        st.download_button(
-            "下载中文 Excel",
-            data=export_files["excel_zh"],
-            file_name=f"{quote_no}_中文报价单.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
-with d2:
-    if "excel_en" in export_files:
-        st.download_button(
-            "下载英文 Excel",
-            data=export_files["excel_en"],
-            file_name=f"{quote_no}_English_Quotation.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
-with d3:
-    if "pdf_zh" in export_files:
-        st.download_button(
-            "下载中文 PDF",
-            data=export_files["pdf_zh"],
-            file_name=f"{quote_no}_中文报价单.pdf",
-            mime="application/pdf",
-            use_container_width=True,
-        )
-with d4:
-    if "pdf_en" in export_files:
-        st.download_button(
-            "下载英文 PDF",
-            data=export_files["pdf_en"],
-            file_name=f"{quote_no}_English_Quotation.pdf",
-            mime="application/pdf",
-            use_container_width=True,
-        )
+            export_state["pdf_en"] = export_quote_pdf(items, customer, quote_no, price_note, lang="en")
+    if "pdf_en" in export_state:
+        st.download_button("下载英文 PDF", export_state["pdf_en"], file_name=f"{quote_no}_English_Quotation.pdf", mime="application/pdf", use_container_width=True)

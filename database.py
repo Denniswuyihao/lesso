@@ -1,13 +1,15 @@
 from __future__ import annotations
-import streamlit as st
+
 import os
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Optional
 from urllib.parse import quote
 
 import pandas as pd
 import requests
+import streamlit as st
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
@@ -20,81 +22,87 @@ except Exception:
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "products.db"
-
 DATA_DIR.mkdir(exist_ok=True)
 
+_ENGINE: Engine | None = None
+_DB_INIT_DONE = False
 
-def _has_streamlit_secrets_file() -> bool:
-    """Only touch st.secrets when a secrets.toml file actually exists.
-    This avoids Streamlit's "No secrets files found" error during local use.
-    """
-    candidates = [
-        Path.home() / ".streamlit" / "secrets.toml",
-        Path.cwd() / ".streamlit" / "secrets.toml",
-        BASE_DIR / ".streamlit" / "secrets.toml",
-    ]
-    return any(path.exists() for path in candidates)
+# Normalized products table. 兼容原卫浴报价表，也兼容新版 PPR 宽表。
+PRODUCT_COLUMNS = [
+    "sap", "category", "cn_name", "en_name", "model", "description",
+    "color", "size_mm", "weight", "material_description",
+    "price", "price_cny", "stock", "packing_volume", "qty_per_ctn",
+    "package_length", "package_width", "package_height",
+    "unit", "currency", "package_info", "image_url", "active",
+]
+
+TEXT_COLUMNS = [
+    "sap", "category", "cn_name", "en_name", "model", "description", "color", "size_mm",
+    "material_description", "unit", "currency", "package_info", "image_url",
+]
+NUMERIC_COLUMNS = [
+    "price", "price_cny", "stock", "packing_volume", "qty_per_ctn",
+    "package_length", "package_width", "package_height", "weight", "active",
+]
+
+EXCEL_ERROR_VALUES = {"#N/A", "#NAME?", "#VALUE!", "#REF!", "#DIV/0!", "nan", "none", "null", ""}
+
+COLUMN_ALIASES = {
+    "sap号": "sap", "sap": "sap", "sap code": "sap", "SAP": "sap", "SAP号": "sap",
+    "分类": "category", "类别": "category", "category": "category",
+    "品名": "cn_name", "中文名": "cn_name", "中文品名": "cn_name", "产品名称": "cn_name", "name": "cn_name",
+    "英文名": "en_name", "英文品名": "en_name", "英文产品名": "en_name", "en_name": "en_name", "english name": "en_name",
+    "型号": "model", "model": "model", "Size(mm)": "size_mm", "size(mm)": "size_mm", "size": "size_mm", "规格": "size_mm",
+    "描述": "description", "产品描述": "description", "description": "description",
+    "颜色": "color", "color": "color", "colour": "color",
+    "重量": "weight", "weight": "weight", "Weight\n(kg/m or pc)": "weight", "weight(kg/m or pc)": "weight", "kg/m": "weight",
+    "物料描述": "material_description", "material_description": "material_description", "物料描述（灰色）": "material_description", "物料描述（绿色）": "material_description",
+    "价格": "price", "报价": "price", "fob": "price", "FOB价": "price", "FOB价（USD/PC）": "price", "fob usd": "price",
+    "灰色基准价格（USD）/m(pcs)": "price", "绿色基准价格（USD）/m(pcs)": "price",
+    "人民币价格": "price_cny", "price_cny": "price_cny", "灰色基准价格（CNY）/m(pcs)": "price_cny", "绿色基准价格（CNY）/m(pcs)": "price_cny",
+    "库存": "stock", "stock": "stock",
+    "包装体积": "packing_volume", "体积": "packing_volume", "cbm": "packing_volume", "CBM": "packing_volume", "CBM/PC": "packing_volume", "cbm/pc": "packing_volume",
+    "Qty/CTN": "qty_per_ctn", "qty/ctn": "qty_per_ctn", "QTY/CTN": "qty_per_ctn", "qty_per_ctn": "qty_per_ctn",
+    "Pcs/Carton": "qty_per_ctn", "pcs/carton": "qty_per_ctn", "一箱所含件": "qty_per_ctn", "每箱数量": "qty_per_ctn", "装箱数量": "qty_per_ctn", "每箱件数": "qty_per_ctn", "pcs/ctn": "qty_per_ctn", "PCS/CTN": "qty_per_ctn",
+    "L": "package_length", "length": "package_length", "长": "package_length",
+    "W": "package_width", "width": "package_width", "宽": "package_width",
+    "H": "package_height", "height": "package_height", "高": "package_height",
+    "单位": "unit", "unit": "unit", "UOM": "unit", "uom": "unit",
+    "币种": "currency", "currency": "currency",
+    "包装": "package_info", "包装信息": "package_info", "package": "package_info", "package_info": "package_info",
+    "图片": "image_url", "图片链接": "image_url", "图片URL": "image_url", "image": "image_url", "image_url": "image_url", "image link": "image_url", "Picture": "image_url", "Picture ": "image_url", "灰色图片": "image_url",
+    "状态": "active", "active": "active", "是否启用": "active",
+}
 
 
 def _read_secret(name: str, default: str | None = None) -> str | None:
-    # 1) Prefer normal environment variables / .env
     value = os.getenv(name)
     if value:
         return value
-
-    # 2) Use Streamlit secrets only when the file exists locally.
-    #    Without this check, Streamlit may stop the app with:
-    #    "No secrets files found. Valid paths are..."
-    if _has_streamlit_secrets_file():
-        try:
-            import streamlit as st
-            value = st.secrets.get(name)
-            if value:
-                return str(value)
-        except Exception:
-            pass
-
-    # 3) Fall back to defaults, usually local SQLite.
+    try:
+        value = st.secrets.get(name)
+        if value:
+            return str(value)
+    except Exception:
+        pass
     return default
 
 
 def get_database_url() -> str:
-    """
-    优先读取 Streamlit Cloud Secrets 里的 DATABASE_URL。
-    如果没有，再读取本地环境变量。
-    如果都没有，才回退到本地 SQLite。
-    """
-
-    url = None
-
-    # 1. 优先读取 Streamlit Cloud Secrets
-    try:
-        url = st.secrets.get("DATABASE_URL")
-    except Exception:
-        url = None
-
-    # 2. 如果 Streamlit Secrets 没有，再读取系统环境变量
-    if not url:
-        url = os.getenv("DATABASE_URL")
-
-    # 3. 如果云端数据库地址仍然没有，才使用本地 SQLite
+    url = _read_secret("DATABASE_URL")
     if not url:
         return f"sqlite:///{DB_PATH}"
-
     url = str(url).strip()
-
-    # 4. 兼容 postgres:// 写法
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql+psycopg2://", 1)
-
-    # 5. 如果是 postgresql://，但没有指定 psycopg2，也自动补上
     if url.startswith("postgresql://"):
         url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
-
     return url
 
 
 DATABASE_URL = get_database_url()
+
+
 def get_database_backend_name() -> str:
     if DATABASE_URL.startswith("postgresql"):
         return "PostgreSQL / Supabase"
@@ -102,38 +110,11 @@ def get_database_backend_name() -> str:
         return "SQLite / Local"
     return "Unknown"
 
-_ENGINE: Engine | None = None
-_DB_INIT_DONE = False
-
-PRODUCT_COLUMNS = [
-    "sap", "category", "cn_name", "en_name", "model", "description", "price", "stock",
-    "packing_volume", "unit", "currency", "package_info", "image_url", "active"
-]
-
-COLUMN_ALIASES = {
-    "sap号": "sap", "sap": "sap", "sap code": "sap", "SAP": "sap", "SAP号": "sap",
-    "分类": "category", "类别": "category", "category": "category",
-    "品名": "cn_name", "中文名": "cn_name", "中文品名": "cn_name", "产品名称": "cn_name", "name": "cn_name",
-    "英文名": "en_name", "英文品名": "en_name", "英文产品名": "en_name", "en_name": "en_name", "english name": "en_name",
-    "型号": "model", "model": "model",
-    "描述": "description", "产品描述": "description", "description": "description",
-    "价格": "price", "报价": "price", "fob": "price", "FOB价": "price", "FOB价（USD/PC）": "price", "fob usd": "price",
-    "库存": "stock", "stock": "stock",
-    "包装体积": "packing_volume", "体积": "packing_volume", "cbm": "packing_volume", "CBM": "packing_volume",
-    "单位": "unit", "unit": "unit",
-    "币种": "currency", "currency": "currency",
-    "包装": "package_info", "包装信息": "package_info", "package": "package_info", "package_info": "package_info",
-    "图片": "image_url", "图片链接": "image_url", "图片URL": "image_url", "image": "image_url", "image_url": "image_url", "image link": "image_url",
-    "状态": "active", "active": "active", "是否启用": "active",
-}
-
 
 def get_engine() -> Engine:
     global _ENGINE
     if _ENGINE is None:
-        connect_args = {}
-        if DATABASE_URL.startswith("sqlite"):
-            connect_args = {"check_same_thread": False}
+        connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
         _ENGINE = create_engine(DATABASE_URL, future=True, pool_pre_ping=True, connect_args=connect_args)
     return _ENGINE
 
@@ -142,29 +123,78 @@ def _dialect() -> str:
     return get_engine().dialect.name
 
 
-def init_db() -> None:
-    """Initialize schema only once per running app process.
+def _table_exists(conn, table_name: str) -> bool:
+    if _dialect() == "sqlite":
+        row = conn.execute(text("SELECT name FROM sqlite_master WHERE type='table' AND name=:t"), {"t": table_name}).fetchone()
+        return row is not None
+    row = conn.execute(
+        text("SELECT table_name FROM information_schema.tables WHERE table_schema=current_schema() AND table_name=:t"),
+        {"t": table_name},
+    ).fetchone()
+    return row is not None
 
-    Streamlit reruns the script frequently; without this guard every product query
-    will also execute CREATE TABLE / schema checks, which slows cloud deployments.
+
+def _product_columns(conn) -> set[str]:
+    if not _table_exists(conn, "products"):
+        return set()
+    if _dialect() == "sqlite":
+        rows = conn.execute(text("PRAGMA table_info(products)")).fetchall()
+        return {row[1] for row in rows}
+    rows = conn.execute(text("""
+        SELECT column_name FROM information_schema.columns
+        WHERE table_name='products' AND table_schema=current_schema()
+    """)).fetchall()
+    return {row[0] for row in rows}
+
+
+def _backup_invalid_products_if_needed(conn) -> None:
+    cols = _product_columns(conn)
+    if cols and "sap" not in cols:
+        suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_name = f"products_invalid_{suffix}"
+        conn.execute(text(f"ALTER TABLE products RENAME TO {backup_name}"))
+
+
+def init_db() -> None:
+    """Create/migrate tables.
+
+    The Streamlit process may keep _DB_INIT_DONE=True while the Supabase products table
+    is manually deleted. Therefore, even after initialization we quickly re-check the
+    required tables and rebuild if missing.
     """
     global _DB_INIT_DONE
-    if _DB_INIT_DONE:
-        return
-
     engine = get_engine()
+    if _DB_INIT_DONE:
+        try:
+            with engine.connect() as conn:
+                if _table_exists(conn, "products") and _table_exists(conn, "users") and _table_exists(conn, "quote_history"):
+                    return
+        except Exception:
+            pass
+        _DB_INIT_DONE = False
+
     with engine.begin() as conn:
+        _backup_invalid_products_if_needed(conn)
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS products (
                 sap VARCHAR(80) PRIMARY KEY,
                 category TEXT,
                 cn_name TEXT,
-                en_name TEXT,
+                en_name TEXT DEFAULT '',
                 model TEXT,
                 description TEXT,
+                color TEXT DEFAULT '',
+                size_mm TEXT DEFAULT '',
+                weight REAL DEFAULT 0,
+                material_description TEXT DEFAULT '',
                 price REAL DEFAULT 0,
+                price_cny REAL DEFAULT 0,
                 stock INTEGER DEFAULT 0,
                 packing_volume REAL DEFAULT 0,
+                qty_per_ctn REAL DEFAULT 0,
+                package_length REAL DEFAULT 0,
+                package_width REAL DEFAULT 0,
+                package_height REAL DEFAULT 0,
                 unit TEXT DEFAULT 'PC',
                 currency TEXT DEFAULT 'USD',
                 package_info TEXT,
@@ -206,36 +236,223 @@ def init_db() -> None:
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """))
+
+    migrate_products_table()
+    with engine.begin() as conn:
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_products_active_category_sap ON products(active, category, sap)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_products_category_sap ON products(category, sap)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_products_sap_lookup ON products(sap)"))
-    migrate_products_table()
     _DB_INIT_DONE = True
 
 
 def migrate_products_table() -> None:
-    """兼容旧数据库：给旧表补英文名等新字段。"""
-    engine = get_engine()
     required = {
+        "category": "TEXT",
+        "cn_name": "TEXT",
         "en_name": "TEXT DEFAULT ''",
+        "model": "TEXT",
+        "description": "TEXT",
+        "color": "TEXT DEFAULT ''",
+        "size_mm": "TEXT DEFAULT ''",
+        "weight": "REAL DEFAULT 0",
+        "material_description": "TEXT DEFAULT ''",
+        "price": "REAL DEFAULT 0",
+        "price_cny": "REAL DEFAULT 0",
+        "stock": "INTEGER DEFAULT 0",
+        "packing_volume": "REAL DEFAULT 0",
+        "qty_per_ctn": "REAL DEFAULT 0",
+        "package_length": "REAL DEFAULT 0",
+        "package_width": "REAL DEFAULT 0",
+        "package_height": "REAL DEFAULT 0",
+        "unit": "TEXT DEFAULT 'PC'",
+        "currency": "TEXT DEFAULT 'USD'",
+        "package_info": "TEXT",
         "image_url": "TEXT DEFAULT ''",
         "active": "INTEGER DEFAULT 1",
+        "created_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+        "updated_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
     }
-    with engine.begin() as conn:
-        if _dialect() == "sqlite":
-            rows = conn.execute(text("PRAGMA table_info(products)")).fetchall()
-            existing = {row[1] for row in rows}
-        elif _dialect() == "postgresql":
-            rows = conn.execute(text("""
-                SELECT column_name FROM information_schema.columns
-                WHERE table_name = 'products' AND table_schema = current_schema()
-            """)).fetchall()
-            existing = {row[0] for row in rows}
-        else:
-            existing = set()
+    with get_engine().begin() as conn:
+        existing = _product_columns(conn)
+        if existing and "sap" not in existing:
+            _backup_invalid_products_if_needed(conn)
+            existing = _product_columns(conn)
         for col, definition in required.items():
             if col not in existing:
                 conn.execute(text(f"ALTER TABLE products ADD COLUMN {col} {definition}"))
+
+
+def _storage_public_url(storage_path: str) -> str:
+    supabase_url = (_read_secret("SUPABASE_URL", "https://oevlzhvdgojgzacnbfka.supabase.co") or "").rstrip("/")
+    bucket = (_read_secret("SUPABASE_STORAGE_BUCKET", "product-images") or "product-images").strip("/")
+    encoded_path = quote(str(storage_path).strip().lstrip("/"), safe="/")
+    if not supabase_url or not bucket or not encoded_path:
+        return ""
+    return f"{supabase_url}/storage/v1/object/public/{bucket}/{encoded_path}"
+
+
+def normalize_image_url(value: object, sap: object | None = None) -> str:
+    raw = clean_scalar(value)
+    if not raw:
+        return ""
+    if raw.startswith("http://") or raw.startswith("https://"):
+        return raw
+
+    bucket = (_read_secret("SUPABASE_STORAGE_BUCKET", "product-images") or "product-images").strip("/")
+    # Default to storage root because current product-images bucket uses paths like 8060040825.jpg/png.
+    prefix = (_read_secret("SUPABASE_STORAGE_PREFIX", "") or "").strip("/")
+
+    if raw.startswith(bucket + "/"):
+        raw = raw[len(bucket) + 1:]
+
+    name = Path(raw).name
+    suffix = Path(name).suffix.lower()
+    if "/" not in raw:
+        if not suffix:
+            stem = clean_scalar(sap or raw)
+            raw = f"{stem}.png"
+        raw = f"{prefix}/{raw}" if prefix else raw
+    elif not suffix and sap:
+        raw = f"{raw}.png"
+    return _storage_public_url(raw)
+
+
+def clean_scalar(value: object) -> str:
+    text_value = str(value if value is not None else "").strip()
+    if text_value.lower() in EXCEL_ERROR_VALUES or text_value.upper() in EXCEL_ERROR_VALUES:
+        return ""
+    if text_value.endswith(".0") and text_value[:-2].isdigit():
+        return text_value[:-2]
+    return text_value
+
+
+def numeric_value(value: object, default: float = 0.0) -> float:
+    text_value = clean_scalar(value)
+    if not text_value:
+        return default
+    try:
+        return float(str(text_value).replace(",", ""))
+    except Exception:
+        return default
+
+
+def _get_col(row: pd.Series, *names: str) -> object:
+    for name in names:
+        if name in row.index:
+            return row.get(name)
+    stripped_map = {str(c).strip(): c for c in row.index}
+    for name in names:
+        key = str(name).strip()
+        if key in stripped_map:
+            return row.get(stripped_map[key])
+    return None
+
+
+def _looks_like_ppr_wide(df: pd.DataFrame) -> bool:
+    cols = {str(c).strip() for c in df.columns}
+    return "Grey SAP No." in cols or "Green SAP No." in cols
+
+
+def expand_ppr_wide_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert PPR quotation wide format into one row per SAP SKU.
+
+    Source columns include Grey SAP No. and Green SAP No.; each source row may become
+    two normalized products. If grey and green SAP are the same, only one row is kept.
+    """
+    rows: list[dict[str, object]] = []
+    seen: set[str] = set()
+
+    for _, r in df.iterrows():
+        en_desc = clean_scalar(_get_col(r, "Description"))
+        cn_name = clean_scalar(_get_col(r, "产品名称"))
+        size = clean_scalar(_get_col(r, "Size(mm)", "Size", "size_mm"))
+        weight = numeric_value(_get_col(r, "Weight\n(kg/m or pc)", "Weight(kg/m or pc)", "weight"))
+        qty_per_ctn = numeric_value(_get_col(r, "Pcs/Carton", "Qty/CTN"))
+        length = numeric_value(_get_col(r, "L"))
+        width = numeric_value(_get_col(r, "W"))
+        height = numeric_value(_get_col(r, "H"))
+        cbm = numeric_value(_get_col(r, "CBM"))
+        if cbm == 0 and length and width and height:
+            cbm = round(length * width * height, 6)
+
+        package_parts = []
+        if qty_per_ctn:
+            package_parts.append(f"{qty_per_ctn:g} pcs/carton")
+        if length or width or height:
+            package_parts.append(f"L{length:g}×W{width:g}×H{height:g} m")
+        package_info = "; ".join(package_parts)
+        is_pipe = "pipe" in en_desc.lower() and "fitting" not in en_desc.lower()
+        unit = "M" if is_pipe else "PCS"
+        category = en_desc or "PPR"
+
+        grey_sap = clean_scalar(_get_col(r, "Grey SAP No."))
+        green_sap = clean_scalar(_get_col(r, "Green SAP No."))
+        variants = [
+            {
+                "sap": grey_sap,
+                "color": "Grey" if grey_sap != green_sap else "Universal",
+                "image_url": clean_scalar(_get_col(r, "灰色图片")),
+                "material_description": clean_scalar(_get_col(r, "物料描述（灰色）")),
+                "price": numeric_value(_get_col(r, "灰色基准价格（USD）/m(pcs)")),
+                "price_cny": numeric_value(_get_col(r, "灰色基准价格（CNY）/m(pcs)")),
+            },
+            {
+                "sap": green_sap,
+                "color": "Green" if grey_sap != green_sap else "Universal",
+                "image_url": clean_scalar(_get_col(r, "Picture ", "Picture")),
+                "material_description": clean_scalar(_get_col(r, "物料描述（绿色）")),
+                "price": numeric_value(_get_col(r, "绿色基准价格（USD）/m(pcs)")),
+                "price_cny": numeric_value(_get_col(r, "绿色基准价格（CNY）/m(pcs)")),
+            },
+        ]
+        for v in variants:
+            sap = clean_scalar(v["sap"])
+            if not sap or sap in seen:
+                continue
+            seen.add(sap)
+            material_desc = clean_scalar(v.get("material_description"))
+            color = clean_scalar(v.get("color"))
+            model_parts = [p for p in [size, color] if p]
+            model = " / ".join(model_parts) if model_parts else size
+            desc_parts = []
+            if en_desc:
+                desc_parts.append(en_desc)
+            if cn_name:
+                desc_parts.append(cn_name)
+            if size:
+                desc_parts.append(f"Size: {size}")
+            if color:
+                desc_parts.append(f"Color: {color}")
+            if weight:
+                desc_parts.append(f"Weight: {weight:g} kg/m or pc")
+            if material_desc:
+                desc_parts.append(material_desc)
+            rows.append({
+                "sap": sap,
+                "category": category,
+                "cn_name": cn_name,
+                "en_name": en_desc,
+                "model": model,
+                "description": " | ".join(desc_parts),
+                "color": color,
+                "size_mm": size,
+                "weight": weight,
+                "material_description": material_desc,
+                "price": float(v.get("price") or 0),
+                "price_cny": float(v.get("price_cny") or 0),
+                "stock": 0,
+                "packing_volume": cbm,
+                "qty_per_ctn": qty_per_ctn,
+                "package_length": length,
+                "package_width": width,
+                "package_height": height,
+                "unit": unit,
+                "currency": "USD",
+                "package_info": package_info,
+                "image_url": clean_scalar(v.get("image_url")),
+                "active": 1,
+            })
+    return pd.DataFrame(rows)
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -250,29 +467,43 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def clean_products_df(df: pd.DataFrame) -> pd.DataFrame:
-    df = normalize_columns(df)
+    if _looks_like_ppr_wide(df):
+        df = expand_ppr_wide_df(df)
+    else:
+        df = normalize_columns(df)
+        if "size_mm" in df.columns and "model" not in df.columns:
+            df["model"] = df["size_mm"]
+
     if "sap" not in df.columns:
-        raise ValueError("导入文件必须包含 SAP 号列，可命名为 sap、SAP、sap号、SAP号。")
+        raise ValueError("导入文件必须包含 SAP 号列，或包含 PPR 宽表字段 Grey SAP No. / Green SAP No.。")
 
     for col in PRODUCT_COLUMNS:
         if col not in df.columns:
             df[col] = None
 
     df = df[PRODUCT_COLUMNS].copy()
-    df["sap"] = df["sap"].astype(str).str.strip()
-    df = df[df["sap"].notna() & (df["sap"] != "") & (df["sap"].str.lower() != "nan")]
+    df["sap"] = df["sap"].apply(clean_scalar)
+    df = df[df["sap"].notna() & (df["sap"] != "")]
 
-    df["price"] = pd.to_numeric(df["price"], errors="coerce").fillna(0)
-    df["stock"] = pd.to_numeric(df["stock"], errors="coerce").fillna(0).astype(int)
-    df["packing_volume"] = pd.to_numeric(df["packing_volume"], errors="coerce").fillna(0)
-    df["active"] = pd.to_numeric(df["active"], errors="coerce").fillna(1).astype(int)
-    df["unit"] = df["unit"].fillna("PC").astype(str).str.strip().replace({"": "PC", "nan": "PC"})
-    df["currency"] = df["currency"].fillna("USD").astype(str).str.strip().replace({"": "USD", "nan": "USD"})
+    for col in NUMERIC_COLUMNS:
+        df[col] = pd.to_numeric(df[col].apply(clean_scalar), errors="coerce").fillna(0)
+    df["stock"] = df["stock"].astype(int)
+    df["active"] = df["active"].replace({0: 0}).fillna(1).astype(int)
 
-    text_cols = ["category", "cn_name", "en_name", "model", "description", "package_info", "image_url"]
-    for col in text_cols:
-        df[col] = df[col].fillna("").astype(str).str.strip().replace({"nan": ""})
+    df["unit"] = df["unit"].fillna("PC").astype(str).str.strip().replace({"": "PC", "nan": "PC", "None": "PC"})
+    df["currency"] = df["currency"].fillna("USD").astype(str).str.strip().replace({"": "USD", "nan": "USD", "None": "USD"})
 
+    for col in TEXT_COLUMNS:
+        df[col] = df[col].fillna("").apply(clean_scalar)
+
+    # Keep model aligned with size when model is empty.
+    df.loc[df["model"] == "", "model"] = df.loc[df["model"] == "", "size_mm"]
+
+    # Convert file names like 8110010814.png into full public URLs. Empty values stay empty.
+    df["image_url"] = df.apply(
+        lambda r: normalize_image_url(r.get("image_url"), r.get("sap")) if clean_scalar(r.get("image_url")) else "",
+        axis=1,
+    )
     return df.drop_duplicates(subset=["sap"], keep="last")
 
 
@@ -280,28 +511,20 @@ def upsert_products(df: pd.DataFrame) -> int:
     init_db()
     df = clean_products_df(df)
     rows = df.to_dict("records")
-    sql = text("""
-        INSERT INTO products (
-            sap, category, cn_name, en_name, model, description, price, stock,
-            packing_volume, unit, currency, package_info, image_url, active
-        ) VALUES (
-            :sap, :category, :cn_name, :en_name, :model, :description, :price, :stock,
-            :packing_volume, :unit, :currency, :package_info, :image_url, :active
-        )
+    if not rows:
+        return 0
+    cols = PRODUCT_COLUMNS
+    insert_cols = ", ".join(cols)
+    values_cols = ", ".join([f":{c}" for c in cols])
+    update_cols = ",\n            ".join([
+        f"{c}=excluded.{c}" if c != "image_url" else "image_url=COALESCE(NULLIF(excluded.image_url, ''), products.image_url)"
+        for c in cols if c != "sap"
+    ])
+    sql = text(f"""
+        INSERT INTO products ({insert_cols})
+        VALUES ({values_cols})
         ON CONFLICT(sap) DO UPDATE SET
-            category=excluded.category,
-            cn_name=excluded.cn_name,
-            en_name=excluded.en_name,
-            model=excluded.model,
-            description=excluded.description,
-            price=excluded.price,
-            stock=excluded.stock,
-            packing_volume=excluded.packing_volume,
-            unit=excluded.unit,
-            currency=excluded.currency,
-            package_info=excluded.package_info,
-            image_url=COALESCE(NULLIF(excluded.image_url, ''), products.image_url),
-            active=excluded.active,
+            {update_cols},
             updated_at=CURRENT_TIMESTAMP
     """)
     with get_engine().begin() as conn:
@@ -310,12 +533,21 @@ def upsert_products(df: pd.DataFrame) -> int:
     return len(rows)
 
 
+def _like_clause_for_term(term_index: int, term: str, params: dict[str, object]) -> str:
+    key = f"kw{term_index}"
+    params[key] = f"%{term.lower()}%"
+    fields = ["sap", "cn_name", "en_name", "model", "description", "category", "color", "size_mm", "material_description"]
+    return "(" + " OR ".join([f"LOWER(COALESCE(CAST({field} AS TEXT), '')) LIKE :{key}" for field in fields]) + ")"
+
+
 def load_products(
     keyword: str = "",
+    sap_list: Optional[list[str]] = None,
     category: str = "全部",
     min_price: Optional[float] = None,
     max_price: Optional[float] = None,
     min_stock: Optional[int] = None,
+    has_image: bool = False,
     only_active: bool = True,
     limit: Optional[int] = 200,
 ) -> pd.DataFrame:
@@ -324,9 +556,20 @@ def load_products(
     params: dict[str, object] = {}
     if only_active:
         where.append("active = 1")
-    if keyword:
-        where.append("(sap LIKE :kw OR cn_name LIKE :kw OR en_name LIKE :kw OR model LIKE :kw OR description LIKE :kw)")
-        params["kw"] = f"%{keyword}%"
+
+    sap_list = [clean_scalar(x) for x in (sap_list or []) if clean_scalar(x)]
+    if sap_list:
+        placeholders = []
+        for i, sap in enumerate(sap_list[:300]):
+            key = f"sap{i}"
+            params[key] = sap.lower()
+            placeholders.append(f":{key}")
+        where.append(f"LOWER(TRIM(CAST(sap AS TEXT))) IN ({', '.join(placeholders)})")
+    elif keyword:
+        terms = [t for t in re.split(r"\s+", keyword.strip()) if t][:6]
+        for i, term in enumerate(terms):
+            where.append(_like_clause_for_term(i, term, params))
+
     if category and category != "全部":
         where.append("category = :category")
         params["category"] = category
@@ -339,13 +582,11 @@ def load_products(
     if min_stock is not None:
         where.append("stock >= :min_stock")
         params["min_stock"] = int(min_stock)
+    if has_image:
+        where.append("image_url IS NOT NULL AND image_url <> ''")
 
-    sql = """
-        SELECT
-            sap, category, cn_name, en_name, model, description, price, stock,
-            packing_volume, unit, currency, package_info, image_url, active
-        FROM products
-    """
+    select_cols = ", ".join(PRODUCT_COLUMNS)
+    sql = f"SELECT {select_cols} FROM products"
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY category, sap"
@@ -354,7 +595,10 @@ def load_products(
         params["limit"] = int(limit)
 
     with get_engine().connect() as conn:
-        return pd.read_sql_query(text(sql), conn, params=params)
+        df = pd.read_sql_query(text(sql), conn, params=params)
+    if not df.empty:
+        df["image_url"] = df.apply(lambda r: normalize_image_url(r.get("image_url"), r.get("sap")) if clean_scalar(r.get("image_url")) else "", axis=1)
+    return df
 
 
 def get_categories() -> list[str]:
@@ -371,29 +615,7 @@ def delete_product(sap: str) -> bool:
     return result.rowcount > 0
 
 
-def _read_storage_secret(name: str, default: str | None = None) -> str | None:
-    """Read Supabase Storage config from Streamlit Secrets or environment variables."""
-    try:
-        value = st.secrets.get(name)
-        if value:
-            return str(value)
-    except Exception:
-        pass
-    value = os.getenv(name)
-    if value:
-        return value
-    return default
-
-
 def _clean_sap_from_image_filename(filename: str) -> str:
-    """Extract a clean SAP code from image filename.
-
-    Examples:
-    8110022978.png -> 8110022978
-    8060050433_副本.png -> 8060050433
-    8060050433 copy.png -> 8060050433
-    8060050433(1).png -> 8060050433
-    """
     stem = Path(filename).stem.strip()
     stem = stem.replace("（", "(").replace("）", ")")
     stem = re.sub(r"\s*\(\d+\)$", "", stem).strip()
@@ -402,20 +624,10 @@ def _clean_sap_from_image_filename(filename: str) -> str:
 
 
 def _upload_image_to_supabase_storage(file, sap: str) -> str:
-    """Upload image to Supabase Storage and return its public URL.
-
-    Default cloud image location:
-        bucket: product-images
-        path: products/<SAP>.<ext>
-
-    Configure in Streamlit Secrets:
-        SUPABASE_STORAGE_BUCKET = "product-images"
-        SUPABASE_STORAGE_PREFIX = "products"
-    """
-    supabase_url = (_read_storage_secret("SUPABASE_URL") or "").rstrip("/")
-    service_key = _read_storage_secret("SUPABASE_SERVICE_ROLE_KEY") or ""
-    bucket = _read_storage_secret("SUPABASE_STORAGE_BUCKET", "product-images") or "product-images"
-    prefix = (_read_storage_secret("SUPABASE_STORAGE_PREFIX", "products") or "products").strip("/")
+    supabase_url = (_read_secret("SUPABASE_URL") or "").rstrip("/")
+    service_key = _read_secret("SUPABASE_SERVICE_ROLE_KEY") or ""
+    bucket = _read_secret("SUPABASE_STORAGE_BUCKET", "product-images") or "product-images"
+    prefix = (_read_secret("SUPABASE_STORAGE_PREFIX", "") or "").strip("/")
 
     if not supabase_url or not service_key:
         raise RuntimeError("缺少 SUPABASE_URL 或 SUPABASE_SERVICE_ROLE_KEY。请在 Streamlit Secrets 中配置。")
@@ -433,12 +645,7 @@ def _upload_image_to_supabase_storage(file, sap: str) -> str:
     upload_url = f"{supabase_url}/storage/v1/object/{bucket}/{storage_path}"
     public_url = f"{supabase_url}/storage/v1/object/public/{bucket}/{storage_path}"
 
-    content_type_map = {
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".png": "image/png",
-        ".webp": "image/webp",
-    }
+    content_type_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}
     headers = {
         "apikey": service_key,
         "Authorization": f"Bearer {service_key}",
@@ -446,28 +653,17 @@ def _upload_image_to_supabase_storage(file, sap: str) -> str:
         "Cache-Control": "3600",
         "x-upsert": "true",
     }
-
     data = file.getvalue()
     response = requests.post(upload_url, headers=headers, data=data, timeout=45)
-
-    # Some Supabase Storage versions return 400 for existing object even when upsert handling differs.
-    # Try PUT once before failing, then expose response text so debugging is precise.
     if response.status_code in (400, 409):
         response = requests.put(upload_url, headers=headers, data=data, timeout=45)
-
     if not response.ok:
         detail = response.text[:500] if response.text else ""
         raise RuntimeError(f"Storage 上传失败：HTTP {response.status_code}，bucket={bucket}，path={raw_storage_path}，详情：{detail}")
-
     return public_url
 
 
 def save_uploaded_images(files: Iterable) -> int:
-    """Upload images to Supabase Storage and bind public URLs to products.image_url.
-
-    文件名建议是 SAP号.png；如果是 SAP号_副本.png，也会自动识别为 SAP号。
-    返回成功绑定到 products 表的图片数量。
-    """
     init_db()
     count = 0
     missing_products: list[str] = []
@@ -486,7 +682,6 @@ def save_uploaded_images(files: Iterable) -> int:
                 count += 1
             else:
                 missing_products.append(sap)
-
     if missing_products:
         preview = ", ".join(missing_products[:10])
         more = "..." if len(missing_products) > 10 else ""
@@ -506,7 +701,7 @@ def save_quote_history(quote_no: str, customer: str, total_amount: float, create
 def get_db_status() -> str:
     if DATABASE_URL.startswith("sqlite"):
         return f"本地 SQLite: {DB_PATH}"
-    safe = DATABASE_URL.split("@")[1] if "@" in DATABASE_URL else DATABASE_URL
+    safe = DATABASE_URL.split("@")[-1] if "@" in DATABASE_URL else DATABASE_URL
     return f"云端数据库: {safe}"
 
 
