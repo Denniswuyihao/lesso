@@ -41,9 +41,6 @@ st.set_page_config(page_title="LESSO 报价系统", page_icon="📦", layout="wi
 try:
     init_db()
     ensure_default_admin()
-    try:
-    init_db()
-    ensure_default_admin()
 
     # ===== 应急管理员账号：登录成功后请删除这段 =====
     emergency_user = st.secrets.get("EMERGENCY_ADMIN_USERNAME", "admin")
@@ -56,6 +53,11 @@ try:
             role="admin",
             active=1
         )
+
+except Exception as exc:
+    st.error("系统初始化失败。请检查 Supabase DATABASE_URL、products 表结构和网络连接。")
+    st.exception(exc)
+    st.stop()
 
 except Exception as exc:
     st.error("系统初始化失败。请检查 Supabase DATABASE_URL、products 表结构和网络连接。")
