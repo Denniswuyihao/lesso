@@ -209,17 +209,29 @@ def render_safe_image(image_url: str | None, width: int = 120, height: int | Non
 
 @st.cache_data(ttl=90, show_spinner=False)
 def cached_categories() -> list[str]:
-    return get_categories()
+    try:
+        return get_categories()
+    except Exception as exc:
+        st.warning(f"分类读取失败，请检查 Supabase 数据库连接：{exc}")
+        return ["全部"]
 
 
 @st.cache_data(ttl=90, show_spinner=False)
 def cached_product_types() -> list[str]:
-    return get_product_types()
+    try:
+        return get_product_types()
+    except Exception as exc:
+        st.warning(f"产品大类读取失败，请检查 Supabase 数据库连接：{exc}")
+        return ["全部"]
 
 
 @st.cache_data(ttl=90, show_spinner=False)
 def cached_subcategories(product_type: str = "全部") -> list[str]:
-    return get_subcategories(product_type)
+    try:
+        return get_subcategories(product_type)
+    except Exception as exc:
+        st.warning(f"产品小类读取失败，请检查 Supabase 数据库连接：{exc}")
+        return ["全部"]
 
 
 @st.cache_data(ttl=90, show_spinner=False)
